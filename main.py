@@ -3,20 +3,18 @@ import requests
 import firebase_admin
 from firebase_admin import credentials, firestore
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware  # <--- NEW IMPORT
 from pydantic import BaseModel
 
 # 1. Initialize Firebase
 cred = None
-# Check if running on Render (Environment Variable)
 if os.environ.get("FIREBASE_CREDENTIALS"):
     import json
     service_account_info = json.loads(os.environ.get("FIREBASE_CREDENTIALS"))
     cred = credentials.Certificate(service_account_info)
-# Check if running locally (File)
 elif os.path.exists("serviceAccountKey.json"):
     cred = credentials.Certificate("serviceAccountKey.json")
 
-# Only initialize if not already initialized
 if not firebase_admin._apps:
     firebase_admin.initialize_app(cred)
 
@@ -25,7 +23,16 @@ db = firestore.client()
 # 2. Setup App
 app = FastAPI()
 
-# 3. Gemini Configuration (Raw HTTP)
+# --- NEW: CORS CONFIGURATION (The Fix) ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows ALL origins (Mobile App, Localhost, Website)
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods (POST, GET, etc.)
+    allow_headers=["*"],  # Allows all headers
+)
+
+# 3. Gemini Configuration
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 MODEL_NAME = "gemini-2.5-flash-lite-preview-09-2025"
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent?key={GEMINI_API_KEY}"
@@ -42,12 +49,12 @@ class ChatRequest(BaseModel):
 
 @app.get("/")
 def home():
-    return {"status": "Shikhbo AI Backend is Running (Zero-Dep Mode)"}
+    return {"status": "Shikhbo AI Backend is Running (CORS Enabled)"}
 
 @app.post("/chat")
 def chat_tutor(request: ChatRequest):
     try:
-        # A. RAG STEP: Fetch Book Content
+        # A. RAG STEP
         doc_id = f"{request.class_level}_{request.subject}_{request.chapter}"
         doc_ref = db.collection("book_content").document(doc_id)
         doc = doc_ref.get()
@@ -65,7 +72,7 @@ def chat_tutor(request: ChatRequest):
         Student: {request.message}
         """
 
-        # C. Call Gemini via Raw HTTP (The Fix)
+        # C. Call Gemini
         payload = {
             "contents": [{
                 "parts": [{"text": full_prompt}]
@@ -73,7 +80,6 @@ def chat_tutor(request: ChatRequest):
         }
         
         headers = {"Content-Type": "application/json"}
-        
         response = requests.post(GEMINI_URL, json=payload, headers=headers)
         
         if response.status_code != 200:
@@ -81,7 +87,6 @@ def chat_tutor(request: ChatRequest):
             
         data = response.json()
         
-        # Extract Text
         try:
             ai_reply = data['candidates'][0]['content']['parts'][0]['text']
         except (KeyError, IndexError):
