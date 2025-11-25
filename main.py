@@ -1,50 +1,53 @@
 import os
+import requests
 import firebase_admin
 from firebase_admin import credentials, firestore
-from fastapi import FastAPI, HTTPException, Request
-import google.generative_ai as genai
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-# 1. Initialize Firebase (Database)
-# On Render, we will use an Environment Variable. Locally, use the file.
+# 1. Initialize Firebase
 cred = None
-if os.path.exists("serviceAccountKey.json"):
-    cred = credentials.Certificate("serviceAccountKey.json")
-else:
-    # This logic handles Render's environment variable approach
+# Check if running on Render (Environment Variable)
+if os.environ.get("FIREBASE_CREDENTIALS"):
     import json
     service_account_info = json.loads(os.environ.get("FIREBASE_CREDENTIALS"))
     cred = credentials.Certificate(service_account_info)
+# Check if running locally (File)
+elif os.path.exists("serviceAccountKey.json"):
+    cred = credentials.Certificate("serviceAccountKey.json")
 
-firebase_admin.initialize_app(cred)
+# Only initialize if not already initialized
+if not firebase_admin._apps:
+    firebase_admin.initialize_app(cred)
+
 db = firestore.client()
 
-# 2. Initialize Gemini (AI)
-genai.configure(api_key=os.environ.get("GEMINI_API_KEY", "YOUR_API_KEY_HERE_FOR_TESTING"))
-model = genai.GenerativeModel('gemini-2.5-flash-lite-preview-09-2025')
-
-# 3. Setup App
+# 2. Setup App
 app = FastAPI()
+
+# 3. Gemini Configuration (Raw HTTP)
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+MODEL_NAME = "gemini-2.5-flash-lite-preview-09-2025"
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent?key={GEMINI_API_KEY}"
 
 # --- Data Models ---
 class ChatRequest(BaseModel):
     user_id: str
     message: str
-    class_level: str  # e.g., "class_10"
-    subject: str      # e.g., "physics"
-    chapter: str      # e.g., "ch3"
+    class_level: str
+    subject: str
+    chapter: str
 
 # --- Endpoints ---
 
 @app.get("/")
 def home():
-    return {"status": "Shikhbo AI Backend is Running"}
+    return {"status": "Shikhbo AI Backend is Running (Zero-Dep Mode)"}
 
 @app.post("/chat")
-async def chat_tutor(request: ChatRequest):
+def chat_tutor(request: ChatRequest):
     try:
-        # A. RAG STEP: Fetch the Book Content from Firestore
-        # We construct the ID: "class_10_physics_ch3"
+        # A. RAG STEP: Fetch Book Content
         doc_id = f"{request.class_level}_{request.subject}_{request.chapter}"
         doc_ref = db.collection("book_content").document(doc_id)
         doc = doc_ref.get()
@@ -52,25 +55,39 @@ async def chat_tutor(request: ChatRequest):
         book_context = ""
         if doc.exists:
             book_context = doc.to_dict().get("text_content", "")
-        else:
-            print(f"Warning: No book found for {doc_id}")
-            # Fallback: AI uses general knowledge if book is missing
 
-        # B. Construct the Prompt
-        prompt = f"""
-        System: You are a Bangladeshi Tutor. Use the provided book context to answer.
-        Context: {book_context[:20000]}  # Limit context to avoid errors
+        # B. Construct Prompt
+        system_instruction = "You are a friendly Bangladeshi Tutor. Use the provided book context."
+        full_prompt = f"""
+        System: {system_instruction}
+        Context: {book_context[:15000]}
         
         Student: {request.message}
         """
 
-        # C. Call Gemini
-        response = model.generate_content(prompt)
+        # C. Call Gemini via Raw HTTP (The Fix)
+        payload = {
+            "contents": [{
+                "parts": [{"text": full_prompt}]
+            }]
+        }
         
-        # D. Save Chat History to Firestore (Optional - for History tab)
-        # db.collection("users").document(request.user_id).collection("history").add({...})
+        headers = {"Content-Type": "application/json"}
+        
+        response = requests.post(GEMINI_URL, json=payload, headers=headers)
+        
+        if response.status_code != 200:
+            return {"reply": f"Error from Google: {response.text}"}
+            
+        data = response.json()
+        
+        # Extract Text
+        try:
+            ai_reply = data['candidates'][0]['content']['parts'][0]['text']
+        except (KeyError, IndexError):
+            ai_reply = "Sorry, I couldn't understand that."
 
-        return {"reply": response.text}
+        return {"reply": ai_reply}
 
     except Exception as e:
         print(f"Error: {e}")
