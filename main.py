@@ -67,23 +67,51 @@ def call_gemini_raw(prompt: str):
 
 @app.get("/")
 def home():
-    return {"status": "Shikhbo Backend Live (Fixed History Sorting)"}
+    return {"status": "Shikhbo Backend Live (Sessions Enabled)"}
 
-# GET HISTORY (The Fix for your issue)
+# --- NEW: GET SESSIONS (Populates the History List) ---
+@app.get("/sessions")
+def get_sessions(user_id: str):
+    try:
+        # 1. Reference to the parent collection
+        sessions_ref = db.collection("users").document(user_id).collection("chat_sessions")
+        
+        # 2. Fetch all sessions (No index required for basic fetch)
+        docs = sessions_ref.stream()
+        
+        sessions = []
+        for doc in docs:
+            data = doc.to_dict()
+            sessions.append({
+                "id": doc.id,
+                "subject": data.get("subject", "Unknown"),
+                "chapter": data.get("chapter", "Unknown"),
+                "title_bn": data.get("title_bn", ""),
+                "updated_at": data.get("updated_at", 0),
+                "preview": data.get("preview", "")
+            })
+            
+        # 3. Sort by Date (Newest First) in Python
+        sessions.sort(key=lambda x: x["updated_at"], reverse=True)
+        
+        return {"sessions": sessions}
+
+    except Exception as e:
+        print(f"Sessions Error: {e}")
+        return {"sessions": []}
+
+# --- GET HISTORY (Messages inside a session) ---
 @app.get("/history")
 def get_history(user_id: str, subject: str, chapter: str):
     try:
-        # 1. Construct Session ID
+        # Construct Session ID
         session_id = f"{subject}_{chapter}"
         
-        # 2. Reference
         history_ref = db.collection("users").document(user_id)\
                         .collection("chat_sessions").document(session_id)\
                         .collection("messages")
         
-        # 3. CRITICAL FIX: Fetch WITHOUT .order_by()
-        # Firestore throws 500 error if you sort without an index.
-        # We fetch the last 50 docs and sort them in Python instead.
+        # Fetch WITHOUT .order_by() to avoid index errors
         docs = history_ref.limit(50).stream()
         
         messages = []
@@ -96,63 +124,71 @@ def get_history(user_id: str, subject: str, chapter: str):
                 "time": data.get("timestamp", 0)
             })
         
-        # 4. Sort in Python (Oldest -> Newest)
+        # Sort Oldest -> Newest
         messages.sort(key=lambda x: x["time"])
         
         return {"messages": messages}
 
     except Exception as e:
         print(f"History Error: {e}")
-        # Return empty list so app doesn't crash
         return {"messages": []}
 
-# CHAT ENDPOINT
+# --- POST CHAT (Updates Parent Session + Adds Message) ---
 @app.post("/chat")
 def chat_tutor(request: ChatRequest):
     try:
         session_id = f"{request.subject}_{request.chapter}"
-        
-        # 1. Save User Message Immediately
-        history_ref = db.collection("users").document(request.user_id)\
-                        .collection("chat_sessions").document(session_id)\
-                        .collection("messages")
+        user_doc_ref = db.collection("users").document(request.user_id)
+        session_ref = user_doc_ref.collection("chat_sessions").document(session_id)
+        messages_ref = session_ref.collection("messages")
         
         current_ts = int(time.time() * 1000)
-        history_ref.add({
+
+        # 1. UPDATE PARENT SESSION (Critical for History List)
+        # This ensures the document exists and has metadata for /sessions endpoint
+        session_ref.set({
+            "subject": request.subject,
+            "chapter": request.chapter,
+            "updated_at": current_ts,
+            "preview": request.message[:60] + "..." if len(request.message) > 60 else request.message,
+            # Optional: You could pass title_bn from frontend if needed
+        }, merge=True)
+
+        # 2. Save User Message
+        messages_ref.add({
             "text": request.message, 
             "sender": "user", 
             "timestamp": current_ts
         })
 
-        # 2. Get Context (Last 3 messages) - manual sort
-        docs = history_ref.limit(5).stream()
+        # 3. RAG: Get Book Content
+        doc_id = f"{request.class_level}_{request.subject}_{request.chapter}"
+        book_doc = db.collection("book_content").document(doc_id).get()
+        book_context = book_doc.to_dict().get("text_content", "") if book_doc.exists else ""
+
+        # 4. Context: Get Last 3 messages
+        docs = messages_ref.limit(5).stream()
         msgs_list = []
-        for d in docs:
-            msgs_list.append(d.to_dict())
-        msgs_list.sort(key=lambda x: x['timestamp']) # Sort oldest to newest
+        for d in docs: msgs_list.append(d.to_dict())
+        msgs_list.sort(key=lambda x: x['timestamp'])
         
         history_text = ""
         for m in msgs_list:
             role = "Student" if m['sender'] == 'user' else "Tutor"
             history_text += f"{role}: {m['text']}\n"
 
-        # 3. Get Book Content
-        doc_id = f"{request.class_level}_{request.subject}_{request.chapter}"
-        book_doc = db.collection("book_content").document(doc_id).get()
-        book_context = book_doc.to_dict().get("text_content", "") if book_doc.exists else ""
-
-        # 4. Ask Gemini
+        # 5. Ask Gemini
         full_prompt = f"""
         System: You are a friendly Bangladeshi Tutor.
-        Book Context: {book_context[:15000]}
+        Book Context: {book_context[:10000]}
         History: {history_text}
         Student Question: {request.message}
         """
         
         ai_reply = call_gemini_raw(full_prompt)
 
-        # 5. Save AI Message
-        history_ref.add({
+        # 6. Save AI Message
+        messages_ref.add({
             "text": ai_reply, 
             "sender": "ai", 
             "timestamp": current_ts + 1
@@ -164,14 +200,11 @@ def chat_tutor(request: ChatRequest):
         print(f"Chat Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# VISION ENDPOINT
+# --- POST VISION ---
 @app.post("/analyze-image")
 def analyze_image(request: ImageRequest):
     try:
-        # Simplified Vision Call
         prompt = "Analyze this math problem. Return the solution in steps."
-        
-        # Clean Base64
         b64 = request.image_base64
         if "," in b64: b64 = b64.split(",")[1]
 
