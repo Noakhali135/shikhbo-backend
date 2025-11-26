@@ -104,32 +104,43 @@ def home():
     return {"status": "Shikhbo Backend V2 (Vision Enabled)"}
 
 # 1. GET HISTORY
+# Replace your existing get_history function with this:
+
 @app.get("/history")
 def get_history(user_id: str, subject: str, chapter: str):
     try:
+        # 1. Construct Session ID
         session_id = f"{subject}_{chapter}"
+        print(f"DEBUG: Fetching history for path: users/{user_id}/chat_sessions/{session_id}/messages")
+
         history_ref = db.collection("users").document(user_id)\
                         .collection("chat_sessions").document(session_id)\
                         .collection("messages")
         
-        # Get last 20 messages
-        docs = history_ref.order_by("timestamp", direction=firestore.Query.ASCENDING).limit(20).stream()
+        # 2. Fetch WITHOUT ordering first (Fixes 'Missing Index' error)
+        # We fetch all (limit 50) and sort in Python
+        docs = history_ref.limit(50).stream()
         
         messages = []
         for doc in docs:
             data = doc.to_dict()
             messages.append({
                 "id": doc.id,
-                "text": data.get("text"),
+                "text": data.get("text", ""),
                 "isUser": data.get("sender") == "user",
-                "time": data.get("timestamp")
+                "time": data.get("timestamp", 0)
             })
-            
+        
+        # 3. Sort in Python (Ascending Order: Oldest -> Newest)
+        messages.sort(key=lambda x: x["time"])
+        
+        print(f"DEBUG: Found {len(messages)} messages")
         return {"messages": messages}
-    except Exception as e:
-        print(e)
-        return {"messages": []}
 
+    except Exception as e:
+        print(f"ERROR in get_history: {e}")
+        # Return empty list instead of crashing
+        return {"messages": []}
 # 2. CHAT (With RAG + Memory)
 @app.post("/chat")
 def chat_tutor(request: ChatRequest):
