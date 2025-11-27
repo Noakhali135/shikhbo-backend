@@ -43,14 +43,14 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 MODEL_NAME = "gemini-2.5-flash-lite-preview-09-2025" 
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent?key={GEMINI_API_KEY}"
 
-# --- 4. Data Models (FIXED) ---
+# --- 4. Data Models ---
 class ChatRequest(BaseModel):
     user_id: str
     message: str
     class_level: str
-    group: str        # <--- Added (Was missing, causing 422)
+    group: str
     subject: str
-    chapter_id: str   # <--- Renamed from 'chapter' to match Frontend
+    chapter_id: str
 
 class ImageRequest(BaseModel):
     image_base64: str
@@ -85,6 +85,37 @@ def call_gemini_raw(system_instruction: str, prompt: str):
 def home():
     return {"status": "Shikhbo AI Tutor Backend Live"}
 
+# --- NEW: GET DYNAMIC CURRICULUM ---
+@app.get("/curriculum")
+def get_curriculum(class_level: str, group: str):
+    """
+    Fetches the dynamic chapter list from Firestore.
+    The Frontend uses this to update its local cache silently.
+    
+    Database Structure Expected:
+    Collection: 'curriculum_metadata'
+    Document ID: 'Class_10_Science' (spaces replaced by underscores)
+    Fields: { 'Physics': [...], 'Chemistry': [...] }
+    """
+    try:
+        # Standardize ID: "Class 10" -> "Class_10"
+        doc_id = f"{class_level}_{group}".replace(" ", "_")
+        
+        doc_ref = db.collection("curriculum_metadata").document(doc_id)
+        doc = doc_ref.get()
+        
+        if doc.exists:
+            # Returns the full map of subjects and chapters
+            return doc.to_dict()
+        else:
+            # If not found, return empty dict (Frontend handles fallback to local defaults)
+            return {}
+
+    except Exception as e:
+        print(f"Curriculum Error: {e}")
+        # Don't crash the app, just return empty so it uses local default
+        return {}
+
 # --- GET SESSIONS (History List) ---
 @app.get("/sessions")
 def get_sessions(user_id: str):
@@ -98,11 +129,10 @@ def get_sessions(user_id: str):
             sessions.append({
                 "id": doc.id,
                 "subject": data.get("subject", "Unknown"),
-                "chapter": data.get("chapter_title", data.get("chapter", "Unknown")), # Fallback
+                "chapter": data.get("chapter_title", data.get("chapter", "Unknown")),
                 "updated_at": data.get("updated_at", 0),
             })
             
-        # Sort by Date (Newest First)
         sessions.sort(key=lambda x: x["updated_at"], reverse=True)
         return {"sessions": sessions}
 
@@ -111,13 +141,9 @@ def get_sessions(user_id: str):
         return {"sessions": []}
 
 # --- GET HISTORY (Messages inside a chapter) ---
-# Note: We alias 'chapter' query param to 'chapter_id' to handle frontend variations
 @app.get("/history")
 def get_history(user_id: str, subject: str, chapter: str = Query(..., alias="chapter")):
     try:
-        # Construct Session ID (Must match POST logic)
-        # NOTE: If frontend sends Title in GET but ID in POST, history won't sync perfectly.
-        # This assumes Frontend is sending the same identifier (ID or Title) in both places.
         session_id = f"{subject}_{chapter}"
         
         history_ref = db.collection("users").document(user_id)\
@@ -148,7 +174,6 @@ def get_history(user_id: str, subject: str, chapter: str = Query(..., alias="cha
 def chat_tutor(request: ChatRequest):
     try:
         # 1. Logic Layer: Pacific Chapter Selection
-        # We use chapter_id to keep sessions unique and lightweight
         session_id = f"{request.subject}_{request.chapter_id}"
         
         user_doc_ref = db.collection("users").document(request.user_id)
@@ -160,7 +185,7 @@ def chat_tutor(request: ChatRequest):
         # 2. Update Session Metadata
         session_ref.set({
             "subject": request.subject,
-            "chapter": request.chapter_id, # Storing ID
+            "chapter": request.chapter_id, 
             "group": request.group,
             "updated_at": current_ts,
             "last_message": request.message[:50]
@@ -174,10 +199,7 @@ def chat_tutor(request: ChatRequest):
         })
 
         # 4. RAG: Fetch "Pacific Chapter" Content
-        # We try to fetch the specific small chapter text file from DB
-        # Doc ID format example: "Class 10_Science_Physics_ch_03"
         rag_doc_id = f"{request.class_level}_{request.subject}_{request.chapter_id}"
-        # Sanitize spaces for DB keys if needed
         rag_doc_id = rag_doc_id.replace(" ", "_")
         
         book_doc = db.collection("book_content").document(rag_doc_id).get()
@@ -242,7 +264,6 @@ def analyze_image(request: ImageRequest):
     try:
         prompt = "Analyze this image (likely a math problem or diagram from BD syllabus). Solve it step-by-step."
         b64 = request.image_base64
-        # Remove header if present
         if "," in b64: b64 = b64.split(",")[1]
 
         payload = {
@@ -262,8 +283,7 @@ def analyze_image(request: ImageRequest):
             
         text = response.json()['candidates'][0]['content']['parts'][0]['text']
         
-        # Mocking the JSON structure expected by frontend 'solution' array
-        # In production, you'd use Structured Output (JSON mode)
+        # Mocking the JSON structure expected by frontend
         return {
             "id": "img_sol_1",
             "solution": [
