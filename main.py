@@ -5,7 +5,7 @@ from firebase_admin import credentials, firestore
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional  # <--- Added
+from typing import Optional
 import time
 
 # --- 1. Initialize Firebase ---
@@ -58,7 +58,6 @@ class AvailabilityRequest(BaseModel):
     email: str
     mobile: str
 
-# UPDATED: Fields are now Optional to allow partial updates (Fixes the persistence bug)
 class UserProfileRequest(BaseModel):
     user_id: str
     first_name: Optional[str] = None
@@ -69,6 +68,11 @@ class UserProfileRequest(BaseModel):
     class_level: Optional[str] = None
     group: Optional[str] = None
     language: Optional[str] = None
+
+# NEW: Model for Renaming Session
+class RenameSessionRequest(BaseModel):
+    user_id: str
+    new_title: str
 
 # --- 5. Helper Functions ---
 def call_gemini_raw(system_instruction: str, prompt: str):
@@ -96,17 +100,14 @@ def call_gemini_raw(system_instruction: str, prompt: str):
 def home():
     return {"status": "Shikhbo AI Tutor Backend Live"}
 
-# --- CHECK AVAILABILITY ---
+# --- AUTH & PROFILE ---
 @app.post("/auth/check-availability")
 def check_availability(req: AvailabilityRequest):
     try:
-        # Check Phone
         phone_query = db.collection("users").where("mobile", "==", req.mobile).limit(1).stream()
         for doc in phone_query:
-            # 409 Conflict status code indicates resource already exists
             raise HTTPException(status_code=409, detail="Mobile number already registered")
         
-        # Check Email
         email_query = db.collection("users").where("email", "==", req.email).limit(1).stream()
         for doc in email_query:
             raise HTTPException(status_code=409, detail="Email already registered")
@@ -117,36 +118,24 @@ def check_availability(req: AvailabilityRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- UPDATED: SAVE USER PROFILE (Partial Updates) ---
 @app.post("/user/profile")
 def update_user_profile(profile: UserProfileRequest):
     try:
         doc_ref = db.collection("users").document(profile.user_id)
+        update_data = {k: v for k, v in profile.dict().items() if v is not None and k != "user_id"}
         
-        # Only include fields that are NOT None
-        update_data = {
-            k: v for k, v in profile.dict().items() 
-            if v is not None and k != "user_id"
-        }
-        
-        # Calculate full name if first name is provided
         if profile.first_name:
             fname = profile.first_name or ""
             mname = profile.middle_name or ""
             lname = profile.last_name or ""
-            full_name = f"{fname} {mname} {lname}".replace("  ", " ").strip()
-            update_data["name"] = full_name
+            update_data["name"] = f"{fname} {mname} {lname}".replace("  ", " ").strip()
 
         update_data["last_active"] = int(time.time() * 1000)
-
-        # Merge ensures we update Class/Group without deleting Name/Phone
         doc_ref.set(update_data, merge=True)
         return {"status": "success", "message": "Profile updated"}
     except Exception as e:
-        print(f"Profile Save Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- GET USER PROFILE ---
 @app.get("/user/{user_id}")
 def get_user_profile(user_id: str):
     try:
@@ -160,7 +149,6 @@ def get_user_profile(user_id: str):
         if isinstance(e, HTTPException): raise e
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- GET DYNAMIC CURRICULUM ---
 @app.get("/curriculum")
 def get_curriculum(class_level: str, group: str):
     try:
@@ -174,7 +162,8 @@ def get_curriculum(class_level: str, group: str):
     except Exception as e:
         return {}
 
-# --- SESSIONS & CHAT ---
+# --- UPDATED: SESSIONS ENDPOINTS ---
+
 @app.get("/sessions")
 def get_sessions(user_id: str):
     try:
@@ -187,12 +176,46 @@ def get_sessions(user_id: str):
                 "id": doc.id,
                 "subject": data.get("subject", "Unknown"),
                 "chapter": data.get("chapter", "Unknown"),
+                "custom_title": data.get("custom_title", None), # Added custom title
+                "class_level": data.get("class_level", ""),     # Added Class
+                "group": data.get("group", ""),                 # Added Group
                 "updated_at": data.get("updated_at", 0),
             })
         sessions.sort(key=lambda x: x["updated_at"], reverse=True)
         return {"sessions": sessions}
     except Exception as e:
         return {"sessions": []}
+
+# NEW: Rename Session
+@app.patch("/session/{session_id}/rename")
+def rename_session(session_id: str, request: RenameSessionRequest):
+    try:
+        doc_ref = db.collection("users").document(request.user_id)\
+                    .collection("chat_sessions").document(session_id)
+        
+        doc = doc_ref.get()
+        if not doc.exists:
+            raise HTTPException(status_code=404, detail="Session not found")
+            
+        doc_ref.update({"custom_title": request.new_title})
+        return {"status": "success", "message": "Session renamed"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# NEW: Delete Session
+@app.delete("/session/{session_id}")
+def delete_session(session_id: str, user_id: str = Query(...)):
+    try:
+        doc_ref = db.collection("users").document(user_id)\
+                    .collection("chat_sessions").document(session_id)
+        
+        # Note: In Firestore, deleting a document does NOT automatically delete subcollections (messages).
+        # For a full production app, you'd use a Callable Cloud Function to delete recursively.
+        # For this MVP, deleting the metadata doc hides it from the list, which is sufficient.
+        doc_ref.delete()
+        return {"status": "success", "message": "Session deleted"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/history")
 def get_history(user_id: str, subject: str, chapter: str = Query(..., alias="chapter")):
@@ -223,9 +246,11 @@ def chat_tutor(request: ChatRequest):
         messages_ref = session_ref.collection("messages")
         current_ts = int(time.time() * 1000)
 
+        # Updated: Now saving class_level to metadata for history display
         session_ref.set({
             "subject": request.subject,
             "chapter": request.chapter_id, 
+            "class_level": request.class_level, # Added
             "group": request.group,
             "updated_at": current_ts,
             "last_message": request.message[:50]
