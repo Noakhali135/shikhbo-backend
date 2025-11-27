@@ -5,6 +5,7 @@ from firebase_admin import credentials, firestore
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from typing import Optional  # <--- Added
 import time
 
 # --- 1. Initialize Firebase ---
@@ -53,23 +54,21 @@ class ImageRequest(BaseModel):
     image_base64: str
     user_id: str
 
-# NEW: Model for checking duplicates
 class AvailabilityRequest(BaseModel):
     email: str
     mobile: str
 
-# UPDATED: Detailed User Profile
+# UPDATED: Fields are now Optional to allow partial updates (Fixes the persistence bug)
 class UserProfileRequest(BaseModel):
     user_id: str
-    first_name: str
-    middle_name: str = ""   # Optional
-    last_name: str = ""     # Optional
-    email: str
-    mobile: str
-    # These might be empty during initial registration, filled later in "Setup"
-    class_level: str = ""
-    group: str = ""
-    language: str = "bn"
+    first_name: Optional[str] = None
+    middle_name: Optional[str] = None
+    last_name: Optional[str] = None
+    email: Optional[str] = None
+    mobile: Optional[str] = None
+    class_level: Optional[str] = None
+    group: Optional[str] = None
+    language: Optional[str] = None
 
 # --- 5. Helper Functions ---
 def call_gemini_raw(system_instruction: str, prompt: str):
@@ -97,55 +96,54 @@ def call_gemini_raw(system_instruction: str, prompt: str):
 def home():
     return {"status": "Shikhbo AI Tutor Backend Live"}
 
-# --- NEW: CHECK AVAILABILITY (Prevents Duplicates) ---
+# --- CHECK AVAILABILITY ---
 @app.post("/auth/check-availability")
 def check_availability(req: AvailabilityRequest):
-    """
-    Checks if Email or Phone is already used in the 'users' collection.
-    Returns { "available": false, "reason": "phone" } if found.
-    """
     try:
         # Check Phone
         phone_query = db.collection("users").where("mobile", "==", req.mobile).limit(1).stream()
         for doc in phone_query:
-            return {"available": False, "reason": "mobile", "message": "This phone number is already registered. Please Login."}
+            # 409 Conflict status code indicates resource already exists
+            raise HTTPException(status_code=409, detail="Mobile number already registered")
         
-        # Check Email (Optional here since Firebase Auth handles it, but good for UI feedback)
+        # Check Email
         email_query = db.collection("users").where("email", "==", req.email).limit(1).stream()
         for doc in email_query:
-            return {"available": False, "reason": "email", "message": "This email is already registered. Please Login."}
+            raise HTTPException(status_code=409, detail="Email already registered")
 
         return {"available": True}
+    except HTTPException as he:
+        raise he
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- UPDATED: SAVE USER PROFILE ---
+# --- UPDATED: SAVE USER PROFILE (Partial Updates) ---
 @app.post("/user/profile")
 def update_user_profile(profile: UserProfileRequest):
     try:
         doc_ref = db.collection("users").document(profile.user_id)
         
-        # Create full display name
-        full_name = f"{profile.first_name} {profile.middle_name} {profile.last_name}".replace("  ", " ").strip()
-        
-        data = {
-            "first_name": profile.first_name,
-            "middle_name": profile.middle_name,
-            "last_name": profile.last_name,
-            "name": full_name, # Calculated field for easy display
-            "email": profile.email,
-            "mobile": profile.mobile,
-            "language": profile.language,
-            "last_active": int(time.time() * 1000)
+        # Only include fields that are NOT None
+        update_data = {
+            k: v for k, v in profile.dict().items() 
+            if v is not None and k != "user_id"
         }
         
-        # Only update class/group if provided (don't erase them if sending partial update)
-        if profile.class_level: data["class_level"] = profile.class_level
-        if profile.group: data["group"] = profile.group
+        # Calculate full name if first name is provided
+        if profile.first_name:
+            fname = profile.first_name or ""
+            mname = profile.middle_name or ""
+            lname = profile.last_name or ""
+            full_name = f"{fname} {mname} {lname}".replace("  ", " ").strip()
+            update_data["name"] = full_name
 
-        doc_ref.set(data, merge=True)
-        return {"status": "success", "message": "Profile saved"}
+        update_data["last_active"] = int(time.time() * 1000)
+
+        # Merge ensures we update Class/Group without deleting Name/Phone
+        doc_ref.set(update_data, merge=True)
+        return {"status": "success", "message": "Profile updated"}
     except Exception as e:
+        print(f"Profile Save Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # --- GET USER PROFILE ---
@@ -176,7 +174,7 @@ def get_curriculum(class_level: str, group: str):
     except Exception as e:
         return {}
 
-# --- CHAT & SESSION ENDPOINTS (Same as before) ---
+# --- SESSIONS & CHAT ---
 @app.get("/sessions")
 def get_sessions(user_id: str):
     try:
@@ -255,5 +253,4 @@ def chat_tutor(request: ChatRequest):
 
 @app.post("/analyze-image")
 def analyze_image(request: ImageRequest):
-    # Same as previous...
     return {"id": "img_sol_1", "solution": [{"id": 1, "math": "Analysis", "explanation": "Step-by-step logic..."}]}
