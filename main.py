@@ -67,6 +67,7 @@ class UserProfileRequest(BaseModel):
     mobile: Optional[str] = None
     class_level: Optional[str] = None
     group: Optional[str] = None
+    medium: Optional[str] = None  # <--- ADDED: Now backend accepts 'medium'
     language: Optional[str] = None
 
 # NEW: Model for Renaming Session
@@ -122,7 +123,12 @@ def check_availability(req: AvailabilityRequest):
 def update_user_profile(profile: UserProfileRequest):
     try:
         doc_ref = db.collection("users").document(profile.user_id)
-        update_data = {k: v for k, v in profile.dict().items() if v is not None and k != "user_id"}
+        
+        # Only include fields that are NOT None
+        update_data = {
+            k: v for k, v in profile.dict().items() 
+            if v is not None and k != "user_id"
+        }
         
         if profile.first_name:
             fname = profile.first_name or ""
@@ -131,6 +137,8 @@ def update_user_profile(profile: UserProfileRequest):
             update_data["name"] = f"{fname} {mname} {lname}".replace("  ", " ").strip()
 
         update_data["last_active"] = int(time.time() * 1000)
+
+        # Merge ensures we update Class/Group/Medium without deleting Name/Phone
         doc_ref.set(update_data, merge=True)
         return {"status": "success", "message": "Profile updated"}
     except Exception as e:
@@ -162,7 +170,7 @@ def get_curriculum(class_level: str, group: str):
     except Exception as e:
         return {}
 
-# --- UPDATED: SESSIONS ENDPOINTS ---
+# --- SESSIONS ENDPOINTS ---
 
 @app.get("/sessions")
 def get_sessions(user_id: str):
@@ -176,9 +184,9 @@ def get_sessions(user_id: str):
                 "id": doc.id,
                 "subject": data.get("subject", "Unknown"),
                 "chapter": data.get("chapter", "Unknown"),
-                "custom_title": data.get("custom_title", None), # Added custom title
-                "class_level": data.get("class_level", ""),     # Added Class
-                "group": data.get("group", ""),                 # Added Group
+                "custom_title": data.get("custom_title", None),
+                "class_level": data.get("class_level", ""),
+                "group": data.get("group", ""),
                 "updated_at": data.get("updated_at", 0),
             })
         sessions.sort(key=lambda x: x["updated_at"], reverse=True)
@@ -186,7 +194,6 @@ def get_sessions(user_id: str):
     except Exception as e:
         return {"sessions": []}
 
-# NEW: Rename Session
 @app.patch("/session/{session_id}/rename")
 def rename_session(session_id: str, request: RenameSessionRequest):
     try:
@@ -202,16 +209,11 @@ def rename_session(session_id: str, request: RenameSessionRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# NEW: Delete Session
 @app.delete("/session/{session_id}")
 def delete_session(session_id: str, user_id: str = Query(...)):
     try:
         doc_ref = db.collection("users").document(user_id)\
                     .collection("chat_sessions").document(session_id)
-        
-        # Note: In Firestore, deleting a document does NOT automatically delete subcollections (messages).
-        # For a full production app, you'd use a Callable Cloud Function to delete recursively.
-        # For this MVP, deleting the metadata doc hides it from the list, which is sufficient.
         doc_ref.delete()
         return {"status": "success", "message": "Session deleted"}
     except Exception as e:
@@ -246,11 +248,10 @@ def chat_tutor(request: ChatRequest):
         messages_ref = session_ref.collection("messages")
         current_ts = int(time.time() * 1000)
 
-        # Updated: Now saving class_level to metadata for history display
         session_ref.set({
             "subject": request.subject,
             "chapter": request.chapter_id, 
-            "class_level": request.class_level, # Added
+            "class_level": request.class_level,
             "group": request.group,
             "updated_at": current_ts,
             "last_message": request.message[:50]
