@@ -49,11 +49,9 @@ class ChatRequest(BaseModel):
     group: str
     subject: str
     chapter_id: str
-    session_id: Optional[str] = None # <--- ADDED: Accepts Unique ID
+    session_id: Optional[str] = None 
 
-class ImageRequest(BaseModel):
-    image_base64: str
-    user_id: str
+# REMOVED: ImageRequest class
 
 class AvailabilityRequest(BaseModel):
     email: str
@@ -222,7 +220,9 @@ def get_history(user_id: str, session_id: Optional[str] = Query(None), subject: 
                         .collection("chat_sessions").document(target_id)\
                         .collection("messages")
         
-        docs = history_ref.limit(50).stream()
+        # Sort messages by timestamp ASCENDING so conversation flows correctly
+        docs = history_ref.order_by("timestamp").limit(50).stream()
+        
         messages = []
         for doc in docs:
             data = doc.to_dict()
@@ -232,21 +232,16 @@ def get_history(user_id: str, session_id: Optional[str] = Query(None), subject: 
                 "isUser": data.get("sender") == "user",
                 "time": data.get("timestamp", 0)
             })
-        messages.sort(key=lambda x: x["time"])
         return {"messages": messages}
     except Exception as e:
         return {"messages": []}
 
-# --- UPDATED CHAT LOGIC ---
 @app.post("/chat")
 def chat_tutor(request: ChatRequest):
     try:
-        # 1. CRITICAL FIX: Use the frontend's session_id if provided.
-        # This allows multiple separate chats for the same chapter.
         if request.session_id:
             session_id = request.session_id
         else:
-            # Fallback for old clients
             session_id = f"{request.subject}_{request.chapter_id}"
         
         user_doc_ref = db.collection("users").document(request.user_id)
@@ -254,7 +249,6 @@ def chat_tutor(request: ChatRequest):
         messages_ref = session_ref.collection("messages")
         current_ts = int(time.time() * 1000)
 
-        # 2. Update Session Metadata
         session_ref.set({
             "subject": request.subject,
             "chapter": request.chapter_id, 
@@ -264,23 +258,19 @@ def chat_tutor(request: ChatRequest):
             "last_message": request.message[:50]
         }, merge=True)
 
-        # 3. Save User Message
         messages_ref.add({"text": request.message, "sender": "user", "timestamp": current_ts})
 
-        # 4. RAG Logic (Loads the Book)
         rag_doc_id = f"{request.class_level}_{request.subject}_{request.chapter_id}".replace(" ", "_")
         book_doc = db.collection("book_content").document(rag_doc_id).get()
         book_context = book_doc.to_dict().get("text_content", "") if book_doc.exists else "No specific book content found."
 
-        # 5. Fetch History (Isolate memory to THIS session_id)
-        docs = messages_ref.limit(5).stream()
-        msgs_list = sorted([d.to_dict() for d in docs], key=lambda x: x['timestamp'])
+        docs = messages_ref.order_by("timestamp").limit(5).stream()
+        msgs_list = [d.to_dict() for d in docs] # already sorted by query
         history_text = "\n".join([f"{'Student' if m['sender'] == 'user' else 'Tutor'}: {m['text']}" for m in msgs_list])
 
         system_instruction = f"You are a friendly Bangladeshi tutor for {request.class_level} ({request.group}). Speak in Tanglish. Use Book Context."
         full_prompt = f"BOOK CONTEXT: {book_context[:15000]}\nCHAT HISTORY: {history_text}\nSTUDENT QUESTION: {request.message}"
         
-        # 6. Get AI Response
         ai_reply = call_gemini_raw(system_instruction, full_prompt)
         messages_ref.add({"text": ai_reply, "sender": "ai", "timestamp": current_ts + 1})
 
@@ -288,6 +278,4 @@ def chat_tutor(request: ChatRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/analyze-image")
-def analyze_image(request: ImageRequest):
-    return {"id": "img_sol_1", "solution": [{"id": 1, "math": "Analysis", "explanation": "Step-by-step logic..."}]}
+# REMOVED: @app.post("/analyze-image")
