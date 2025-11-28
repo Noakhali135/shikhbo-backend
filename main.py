@@ -37,7 +37,6 @@ app.add_middleware(
 
 # --- 3. Gemini Configuration ---
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-# Using Flash Lite (Low cost, huge context window)
 MODEL_NAME = "gemini-2.5-flash-lite-preview-09-2025" 
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent?key={GEMINI_API_KEY}"
 
@@ -51,7 +50,7 @@ class ChatRequest(BaseModel):
     subject: str
     chapter_id: str
     session_id: Optional[str] = None
-    medium: Optional[str] = "Bangla Medium" # <--- ADDED: To customize AI language
+    medium: Optional[str] = "Bangla Medium"
 
 class AvailabilityRequest(BaseModel):
     email: str
@@ -79,7 +78,7 @@ def call_gemini_raw(system_instruction: str, prompt: str):
         "contents": [{ "parts": [{ "text": prompt }] }],
         "system_instruction": { "parts": [{ "text": system_instruction }] },
         "generationConfig": {
-            "maxOutputTokens": 2000, # Increased for detailed explanations
+            "maxOutputTokens": 2000,
             "temperature": 0.3
         }
     }
@@ -220,7 +219,6 @@ def get_history(user_id: str, session_id: Optional[str] = Query(None), subject: 
                         .collection("chat_sessions").document(target_id)\
                         .collection("messages")
         
-        # FIXED: Ordered by timestamp
         docs = history_ref.order_by("timestamp").limit(50).stream()
         
         messages = []
@@ -236,11 +234,10 @@ def get_history(user_id: str, session_id: Optional[str] = Query(None), subject: 
     except Exception as e:
         return {"messages": []}
 
-# --- UPDATED CHAT LOGIC ---
+# --- CHAT LOGIC ---
 @app.post("/chat")
 def chat_tutor(request: ChatRequest):
     try:
-        # 1. Session ID Logic
         if request.session_id:
             session_id = request.session_id
         else:
@@ -251,7 +248,6 @@ def chat_tutor(request: ChatRequest):
         messages_ref = session_ref.collection("messages")
         current_ts = int(time.time() * 1000)
 
-        # 2. Update Session Metadata
         session_ref.set({
             "subject": request.subject,
             "chapter": request.chapter_id, 
@@ -261,21 +257,16 @@ def chat_tutor(request: ChatRequest):
             "last_message": request.message[:50]
         }, merge=True)
 
-        # 3. Save User Message
         messages_ref.add({"text": request.message, "sender": "user", "timestamp": current_ts})
 
-        # 4. RAG Logic
         rag_doc_id = f"{request.class_level}_{request.subject}_{request.chapter_id}".replace(" ", "_")
         book_doc = db.collection("book_content").document(rag_doc_id).get()
         book_context = book_doc.to_dict().get("text_content", "") if book_doc.exists else "No specific book content found. Use general knowledge."
 
-        # 5. Fetch History
         docs = messages_ref.order_by("timestamp").limit(10).stream()
         msgs_list = [d.to_dict() for d in docs]
         history_text = "\n".join([f"{'Student' if m['sender'] == 'user' else 'Tutor'}: {m['text']}" for m in msgs_list])
 
-        # 6. Dynamic Language Persona
-        # If English Version, speak English. If Bangla Medium, speak Tanglish.
         lang_instruction = "Speak in a friendly mix of Bangla and English (Tanglish). Act like a Bangladeshi older brother/sister (Bhaiya/Apu)."
         if request.medium and "English" in request.medium:
             lang_instruction = "You are a Tutor for English Version students. Explain primarily in English. You may use Bangla text for very difficult terms only if necessary."
@@ -290,7 +281,6 @@ def chat_tutor(request: ChatRequest):
         3. Use LaTeX formatting for all Math formulas (e.g. $F = ma$).
         """
 
-        # 7. Prompt Construction (OPTIMIZED: No 15k char limit)
         full_prompt = f"""
         BOOK CONTEXT:
         {book_context} 
@@ -302,7 +292,6 @@ def chat_tutor(request: ChatRequest):
         {request.message}
         """
         
-        # 8. AI Response
         ai_reply = call_gemini_raw(system_instruction, full_prompt)
         messages_ref.add({"text": ai_reply, "sender": "ai", "timestamp": current_ts + 1})
 
