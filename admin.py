@@ -10,10 +10,12 @@ import time
 
 # --- 1. Initialize Firebase ---
 cred = None
+# Check for Render Environment Variable first (Production)
 if os.environ.get("FIREBASE_CREDENTIALS"):
     import json
     service_account_info = json.loads(os.environ.get("FIREBASE_CREDENTIALS"))
     cred = credentials.Certificate(service_account_info)
+# Fallback to local file (Development)
 elif os.path.exists("serviceAccountKey.json"):
     cred = credentials.Certificate("serviceAccountKey.json")
 
@@ -28,6 +30,7 @@ db = firestore.client()
 # --- 2. Setup FastAPI ---
 app = FastAPI()
 
+# Allow ALL origins (Crucial for Mobile/Web Access)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -37,7 +40,8 @@ app.add_middleware(
 
 # --- 3. Configuration ---
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-ADMIN_SECRET_KEY = os.environ.get("ADMIN_SECRET_KEY", "my-secret-admin-password") # Set this in Render!
+# Default password if not set in Render (Change this in Render Env Vars!)
+ADMIN_SECRET_KEY = os.environ.get("ADMIN_SECRET_KEY", "my-secret-admin-password") 
 MODEL_NAME = "gemini-2.5-flash-lite-preview-09-2025" 
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent?key={GEMINI_API_KEY}"
 
@@ -83,8 +87,12 @@ class AdminContentUpload(BaseModel):
     chapter_title_bn: str
     text_content: str
 
-# --- 5. Security ---
-def verify_admin(x_admin_key: str = Header(...)):
+# --- 5. Security (FIXED) ---
+def verify_admin(x_admin_key: str = Header(..., alias="X-Admin-Key")):
+    """
+    Validates the Admin Key sent from the React Frontend.
+    'alias="X-Admin-Key"' ensures it matches the exact casing sent by Axios.
+    """
     if x_admin_key != ADMIN_SECRET_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized Admin Access")
 
@@ -104,6 +112,7 @@ def call_gemini_raw(system_instruction: str, prompt: str):
         if response.status_code == 200:
             return response.json()['candidates'][0]['content']['parts'][0]['text']
         else:
+            print(f"Gemini API Error: {response.text}")
             return "I am having trouble thinking right now. Please try again."
     except Exception as e:
         return "Sorry, I am having trouble connecting to the internet."
@@ -156,7 +165,6 @@ def admin_get_user_history(user_id: str):
 def admin_upload_content(data: AdminContentUpload):
     """
     Simultaneously updates the 'Book Content' (Text) AND 'Curriculum Metadata' (List).
-    This automates what you were doing with Python scripts.
     """
     try:
         # 1. Upload Book Text (RAG)
@@ -170,8 +178,6 @@ def admin_upload_content(data: AdminContentUpload):
         curr_doc_id = f"{data.class_level}_{data.group}".replace(" ", "_")
         curr_ref = db.collection("curriculum_metadata").document(curr_doc_id)
         
-        # We need to add the chapter to the specific subject array
-        # This requires reading, appending, and writing back (Transaction safest, but simple read/write okay for MVP admin)
         doc = curr_ref.get()
         if doc.exists:
             curr_data = doc.to_dict()
@@ -202,7 +208,7 @@ def admin_upload_content(data: AdminContentUpload):
         raise HTTPException(status_code=500, detail=str(e))
 
 # ==========================================
-# APP ENDPOINTS (Existing)
+# APP ENDPOINTS (Student App)
 # ==========================================
 
 @app.post("/auth/check-availability")
@@ -363,8 +369,7 @@ def chat_tutor(request: ChatRequest):
         # Save User Message
         messages_ref.add({"text": request.message, "sender": "user", "timestamp": current_ts})
 
-        # Calculate estimated tokens (Approximation: 1 word ~ 1.3 tokens)
-        # We track this on the User Profile
+        # Track Tokens
         user_doc_ref.update({
             "total_usage": firestore.Increment(len(request.message) // 4),
             "last_active": current_ts
@@ -387,7 +392,7 @@ def chat_tutor(request: ChatRequest):
         You are a private tutor for a Bangladeshi student in {request.class_level} ({request.group}).
         {lang_instruction}
         STRICTLY use the provided 'Book Context' to answer.
-        Use LaTeX for Math.
+        Use LaTeX formatting for all Math formulas (e.g. $F = ma$).
         """
 
         full_prompt = f"BOOK CONTEXT:\n{book_context}\nCHAT HISTORY:\n{history_text}\nSTUDENT QUESTION:\n{request.message}"
@@ -395,7 +400,7 @@ def chat_tutor(request: ChatRequest):
         ai_reply = call_gemini_raw(system_instruction, full_prompt)
         messages_ref.add({"text": ai_reply, "sender": "ai", "timestamp": current_ts + 1})
 
-        # Track output usage
+        # Track Output Tokens
         user_doc_ref.update({"total_usage": firestore.Increment(len(ai_reply) // 4)})
 
         return {"reply": ai_reply}
