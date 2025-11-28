@@ -49,6 +49,7 @@ class ChatRequest(BaseModel):
     group: str
     subject: str
     chapter_id: str
+    session_id: Optional[str] = None # <--- ADDED: Accepts Unique ID
 
 class ImageRequest(BaseModel):
     image_base64: str
@@ -67,10 +68,9 @@ class UserProfileRequest(BaseModel):
     mobile: Optional[str] = None
     class_level: Optional[str] = None
     group: Optional[str] = None
-    medium: Optional[str] = None  # <--- ADDED: Now backend accepts 'medium'
+    medium: Optional[str] = None
     language: Optional[str] = None
 
-# NEW: Model for Renaming Session
 class RenameSessionRequest(BaseModel):
     user_id: str
     new_title: str
@@ -108,11 +108,9 @@ def check_availability(req: AvailabilityRequest):
         phone_query = db.collection("users").where("mobile", "==", req.mobile).limit(1).stream()
         for doc in phone_query:
             raise HTTPException(status_code=409, detail="Mobile number already registered")
-        
         email_query = db.collection("users").where("email", "==", req.email).limit(1).stream()
         for doc in email_query:
             raise HTTPException(status_code=409, detail="Email already registered")
-
         return {"available": True}
     except HTTPException as he:
         raise he
@@ -123,12 +121,7 @@ def check_availability(req: AvailabilityRequest):
 def update_user_profile(profile: UserProfileRequest):
     try:
         doc_ref = db.collection("users").document(profile.user_id)
-        
-        # Only include fields that are NOT None
-        update_data = {
-            k: v for k, v in profile.dict().items() 
-            if v is not None and k != "user_id"
-        }
+        update_data = {k: v for k, v in profile.dict().items() if v is not None and k != "user_id"}
         
         if profile.first_name:
             fname = profile.first_name or ""
@@ -137,8 +130,6 @@ def update_user_profile(profile: UserProfileRequest):
             update_data["name"] = f"{fname} {mname} {lname}".replace("  ", " ").strip()
 
         update_data["last_active"] = int(time.time() * 1000)
-
-        # Merge ensures we update Class/Group/Medium without deleting Name/Phone
         doc_ref.set(update_data, merge=True)
         return {"status": "success", "message": "Profile updated"}
     except Exception as e:
@@ -199,11 +190,8 @@ def rename_session(session_id: str, request: RenameSessionRequest):
     try:
         doc_ref = db.collection("users").document(request.user_id)\
                     .collection("chat_sessions").document(session_id)
-        
-        doc = doc_ref.get()
-        if not doc.exists:
+        if not doc_ref.get().exists:
             raise HTTPException(status_code=404, detail="Session not found")
-            
         doc_ref.update({"custom_title": request.new_title})
         return {"status": "success", "message": "Session renamed"}
     except Exception as e:
@@ -220,10 +208,20 @@ def delete_session(session_id: str, user_id: str = Query(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/history")
-def get_history(user_id: str, subject: str, chapter: str = Query(..., alias="chapter")):
+def get_history(user_id: str, session_id: Optional[str] = Query(None), subject: Optional[str] = None, chapter: Optional[str] = None):
     try:
-        session_id = f"{subject}_{chapter}"
-        history_ref = db.collection("users").document(user_id).collection("chat_sessions").document(session_id).collection("messages")
+        # Priority: Use session_id if available, otherwise fallback to old logic
+        if session_id:
+            target_id = session_id
+        elif subject and chapter:
+            target_id = f"{subject}_{chapter}"
+        else:
+            return {"messages": []}
+
+        history_ref = db.collection("users").document(user_id)\
+                        .collection("chat_sessions").document(target_id)\
+                        .collection("messages")
+        
         docs = history_ref.limit(50).stream()
         messages = []
         for doc in docs:
@@ -239,15 +237,24 @@ def get_history(user_id: str, subject: str, chapter: str = Query(..., alias="cha
     except Exception as e:
         return {"messages": []}
 
+# --- UPDATED CHAT LOGIC ---
 @app.post("/chat")
 def chat_tutor(request: ChatRequest):
     try:
-        session_id = f"{request.subject}_{request.chapter_id}"
+        # 1. CRITICAL FIX: Use the frontend's session_id if provided.
+        # This allows multiple separate chats for the same chapter.
+        if request.session_id:
+            session_id = request.session_id
+        else:
+            # Fallback for old clients
+            session_id = f"{request.subject}_{request.chapter_id}"
+        
         user_doc_ref = db.collection("users").document(request.user_id)
         session_ref = user_doc_ref.collection("chat_sessions").document(session_id)
         messages_ref = session_ref.collection("messages")
         current_ts = int(time.time() * 1000)
 
+        # 2. Update Session Metadata
         session_ref.set({
             "subject": request.subject,
             "chapter": request.chapter_id, 
@@ -257,12 +264,15 @@ def chat_tutor(request: ChatRequest):
             "last_message": request.message[:50]
         }, merge=True)
 
+        # 3. Save User Message
         messages_ref.add({"text": request.message, "sender": "user", "timestamp": current_ts})
 
+        # 4. RAG Logic (Loads the Book)
         rag_doc_id = f"{request.class_level}_{request.subject}_{request.chapter_id}".replace(" ", "_")
         book_doc = db.collection("book_content").document(rag_doc_id).get()
         book_context = book_doc.to_dict().get("text_content", "") if book_doc.exists else "No specific book content found."
 
+        # 5. Fetch History (Isolate memory to THIS session_id)
         docs = messages_ref.limit(5).stream()
         msgs_list = sorted([d.to_dict() for d in docs], key=lambda x: x['timestamp'])
         history_text = "\n".join([f"{'Student' if m['sender'] == 'user' else 'Tutor'}: {m['text']}" for m in msgs_list])
@@ -270,6 +280,7 @@ def chat_tutor(request: ChatRequest):
         system_instruction = f"You are a friendly Bangladeshi tutor for {request.class_level} ({request.group}). Speak in Tanglish. Use Book Context."
         full_prompt = f"BOOK CONTEXT: {book_context[:15000]}\nCHAT HISTORY: {history_text}\nSTUDENT QUESTION: {request.message}"
         
+        # 6. Get AI Response
         ai_reply = call_gemini_raw(system_instruction, full_prompt)
         messages_ref.add({"text": ai_reply, "sender": "ai", "timestamp": current_ts + 1})
 
