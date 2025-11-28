@@ -37,7 +37,7 @@ app.add_middleware(
 
 # --- 3. Gemini Configuration ---
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-# Using Flash Lite as requested (High Speed, Low Cost, Long Context)
+# Using Flash Lite (Low cost, huge context window)
 MODEL_NAME = "gemini-2.5-flash-lite-preview-09-2025" 
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent?key={GEMINI_API_KEY}"
 
@@ -79,7 +79,7 @@ def call_gemini_raw(system_instruction: str, prompt: str):
         "contents": [{ "parts": [{ "text": prompt }] }],
         "system_instruction": { "parts": [{ "text": system_instruction }] },
         "generationConfig": {
-            "maxOutputTokens": 2000, # Increased for better explanations
+            "maxOutputTokens": 2000, # Increased for detailed explanations
             "temperature": 0.3
         }
     }
@@ -236,6 +236,7 @@ def get_history(user_id: str, session_id: Optional[str] = Query(None), subject: 
     except Exception as e:
         return {"messages": []}
 
+# --- UPDATED CHAT LOGIC ---
 @app.post("/chat")
 def chat_tutor(request: ChatRequest):
     try:
