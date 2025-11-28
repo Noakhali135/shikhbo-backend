@@ -37,6 +37,7 @@ app.add_middleware(
 
 # --- 3. Gemini Configuration ---
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+# Using Flash Lite as requested (High Speed, Low Cost, Long Context)
 MODEL_NAME = "gemini-2.5-flash-lite-preview-09-2025" 
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent?key={GEMINI_API_KEY}"
 
@@ -49,9 +50,8 @@ class ChatRequest(BaseModel):
     group: str
     subject: str
     chapter_id: str
-    session_id: Optional[str] = None 
-
-# REMOVED: ImageRequest class
+    session_id: Optional[str] = None
+    medium: Optional[str] = "Bangla Medium" # <--- ADDED: To customize AI language
 
 class AvailabilityRequest(BaseModel):
     email: str
@@ -79,7 +79,7 @@ def call_gemini_raw(system_instruction: str, prompt: str):
         "contents": [{ "parts": [{ "text": prompt }] }],
         "system_instruction": { "parts": [{ "text": system_instruction }] },
         "generationConfig": {
-            "maxOutputTokens": 1000,
+            "maxOutputTokens": 2000, # Increased for better explanations
             "temperature": 0.3
         }
     }
@@ -89,6 +89,7 @@ def call_gemini_raw(system_instruction: str, prompt: str):
         if response.status_code == 200:
             return response.json()['candidates'][0]['content']['parts'][0]['text']
         else:
+            print(f"Gemini API Error: {response.text}")
             return "I am having trouble thinking right now. Please try again."
     except Exception as e:
         return "Sorry, I am having trouble connecting to the internet."
@@ -208,7 +209,6 @@ def delete_session(session_id: str, user_id: str = Query(...)):
 @app.get("/history")
 def get_history(user_id: str, session_id: Optional[str] = Query(None), subject: Optional[str] = None, chapter: Optional[str] = None):
     try:
-        # Priority: Use session_id if available, otherwise fallback to old logic
         if session_id:
             target_id = session_id
         elif subject and chapter:
@@ -220,7 +220,7 @@ def get_history(user_id: str, session_id: Optional[str] = Query(None), subject: 
                         .collection("chat_sessions").document(target_id)\
                         .collection("messages")
         
-        # Sort messages by timestamp ASCENDING so conversation flows correctly
+        # FIXED: Ordered by timestamp
         docs = history_ref.order_by("timestamp").limit(50).stream()
         
         messages = []
@@ -239,6 +239,7 @@ def get_history(user_id: str, session_id: Optional[str] = Query(None), subject: 
 @app.post("/chat")
 def chat_tutor(request: ChatRequest):
     try:
+        # 1. Session ID Logic
         if request.session_id:
             session_id = request.session_id
         else:
@@ -249,6 +250,7 @@ def chat_tutor(request: ChatRequest):
         messages_ref = session_ref.collection("messages")
         current_ts = int(time.time() * 1000)
 
+        # 2. Update Session Metadata
         session_ref.set({
             "subject": request.subject,
             "chapter": request.chapter_id, 
@@ -258,24 +260,51 @@ def chat_tutor(request: ChatRequest):
             "last_message": request.message[:50]
         }, merge=True)
 
+        # 3. Save User Message
         messages_ref.add({"text": request.message, "sender": "user", "timestamp": current_ts})
 
+        # 4. RAG Logic
         rag_doc_id = f"{request.class_level}_{request.subject}_{request.chapter_id}".replace(" ", "_")
         book_doc = db.collection("book_content").document(rag_doc_id).get()
-        book_context = book_doc.to_dict().get("text_content", "") if book_doc.exists else "No specific book content found."
+        book_context = book_doc.to_dict().get("text_content", "") if book_doc.exists else "No specific book content found. Use general knowledge."
 
-        docs = messages_ref.order_by("timestamp").limit(5).stream()
-        msgs_list = [d.to_dict() for d in docs] # already sorted by query
+        # 5. Fetch History
+        docs = messages_ref.order_by("timestamp").limit(10).stream()
+        msgs_list = [d.to_dict() for d in docs]
         history_text = "\n".join([f"{'Student' if m['sender'] == 'user' else 'Tutor'}: {m['text']}" for m in msgs_list])
 
-        system_instruction = f"You are a friendly Bangladeshi tutor for {request.class_level} ({request.group}). Speak in Tanglish. Use Book Context."
-        full_prompt = f"BOOK CONTEXT: {book_context}\nCHAT HISTORY: {history_text}\nSTUDENT QUESTION: {request.message}"
+        # 6. Dynamic Language Persona
+        # If English Version, speak English. If Bangla Medium, speak Tanglish.
+        lang_instruction = "Speak in a friendly mix of Bangla and English (Tanglish). Act like a Bangladeshi older brother/sister (Bhaiya/Apu)."
+        if request.medium and "English" in request.medium:
+            lang_instruction = "You are a Tutor for English Version students. Explain primarily in English. You may use Bangla text for very difficult terms only if necessary."
+
+        system_instruction = f"""
+        You are a private tutor for a Bangladeshi student in {request.class_level} ({request.group}).
+        {lang_instruction}
         
+        INSTRUCTIONS:
+        1. STRICTLY use the provided 'Book Context' to answer.
+        2. If the user asks for a Creative Question (Srijonshil), generate one based on the context.
+        3. Use LaTeX formatting for all Math formulas (e.g. $F = ma$).
+        """
+
+        # 7. Prompt Construction (OPTIMIZED: No 15k char limit)
+        full_prompt = f"""
+        BOOK CONTEXT:
+        {book_context} 
+
+        CHAT HISTORY:
+        {history_text}
+
+        STUDENT QUESTION:
+        {request.message}
+        """
+        
+        # 8. AI Response
         ai_reply = call_gemini_raw(system_instruction, full_prompt)
         messages_ref.add({"text": ai_reply, "sender": "ai", "timestamp": current_ts + 1})
 
         return {"reply": ai_reply}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-# REMOVED: @app.post("/analyze-image")
