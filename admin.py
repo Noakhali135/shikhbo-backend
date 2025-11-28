@@ -10,10 +10,12 @@ import time
 
 # --- 1. Initialize Firebase ---
 cred = None
+# Check for Render Environment Variable first (Production)
 if os.environ.get("FIREBASE_CREDENTIALS"):
     import json
     service_account_info = json.loads(os.environ.get("FIREBASE_CREDENTIALS"))
     cred = credentials.Certificate(service_account_info)
+# Fallback to local file (Development)
 elif os.path.exists("serviceAccountKey.json"):
     cred = credentials.Certificate("serviceAccountKey.json")
 
@@ -38,13 +40,14 @@ app.add_middleware(
 
 # --- 3. Configuration ---
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-# Default password if not set in Render (Change this in Render Env Vars!)
+# Admin Password (Set this in Render Env Vars!)
 ADMIN_SECRET_KEY = os.environ.get("ADMIN_SECRET_KEY", "my-secret-admin-password") 
 MODEL_NAME = "gemini-2.5-flash-lite-preview-09-2025" 
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent?key={GEMINI_API_KEY}"
 
 # --- 4. Data Models ---
 
+# Student App Models
 class ChatRequest(BaseModel):
     user_id: str
     message: str
@@ -75,7 +78,7 @@ class RenameSessionRequest(BaseModel):
     user_id: str
     new_title: str
 
-# NEW: Admin Models
+# Admin Models
 class AdminContentUpload(BaseModel):
     class_level: str
     group: str
@@ -85,11 +88,10 @@ class AdminContentUpload(BaseModel):
     chapter_title_bn: str
     text_content: str
 
-# --- 5. Security (For Admin Panel) ---
+# --- 5. Security (Admin Only) ---
 def verify_admin(x_admin_key: str = Header(..., alias="X-Admin-Key")):
     """
     Validates the Admin Key sent from the React Frontend.
-    'alias="X-Admin-Key"' ensures it matches the exact casing sent by Axios.
     """
     if x_admin_key != ADMIN_SECRET_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized Admin Access")
@@ -122,7 +124,7 @@ def home():
     return {"status": "Shikhbo AI Tutor Backend Live"}
 
 # ==========================================
-# ADMIN PANEL ENDPOINTS (Restored)
+# 🔐 ADMIN PANEL ENDPOINTS
 # ==========================================
 
 @app.get("/admin/users", dependencies=[Depends(verify_admin)])
@@ -139,7 +141,7 @@ def admin_get_users():
                 "mobile": d.get("mobile", "N/A"),
                 "class_level": d.get("class_level", "N/A"),
                 "group": d.get("group", "N/A"),
-                "total_usage": d.get("total_usage", 0), # Token usage proxy
+                "total_usage": d.get("total_usage", 0),
                 "last_active": d.get("last_active", 0)
             })
         return {"users": users}
@@ -206,7 +208,7 @@ def admin_upload_content(data: AdminContentUpload):
         raise HTTPException(status_code=500, detail=str(e))
 
 # ==========================================
-# STUDENT APP ENDPOINTS
+# 🎓 STUDENT APP ENDPOINTS
 # ==========================================
 
 @app.post("/auth/check-availability")
