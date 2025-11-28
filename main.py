@@ -10,10 +10,12 @@ import time
 
 # --- 1. Initialize Firebase ---
 cred = None
+# Check for Render Environment Variable first (Production)
 if os.environ.get("FIREBASE_CREDENTIALS"):
     import json
     service_account_info = json.loads(os.environ.get("FIREBASE_CREDENTIALS"))
     cred = credentials.Certificate(service_account_info)
+# Fallback to local file (Development)
 elif os.path.exists("serviceAccountKey.json"):
     cred = credentials.Certificate("serviceAccountKey.json")
 
@@ -28,6 +30,7 @@ db = firestore.client()
 # --- 2. Setup FastAPI ---
 app = FastAPI()
 
+# Allow ALL origins (Crucial for Mobile/Web Access)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -37,6 +40,7 @@ app.add_middleware(
 
 # --- 3. Gemini Configuration ---
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+# Using Flash Lite as requested
 MODEL_NAME = "gemini-2.5-flash-lite-preview-09-2025" 
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent?key={GEMINI_API_KEY}"
 
@@ -74,6 +78,7 @@ class RenameSessionRequest(BaseModel):
 
 # --- 5. Helper Functions ---
 def call_gemini_raw(system_instruction: str, prompt: str):
+    # Constructing payload with System Instruction for persona
     payload = { 
         "contents": [{ "parts": [{ "text": prompt }] }],
         "system_instruction": { "parts": [{ "text": system_instruction }] },
@@ -119,8 +124,10 @@ def check_availability(req: AvailabilityRequest):
 def update_user_profile(profile: UserProfileRequest):
     try:
         doc_ref = db.collection("users").document(profile.user_id)
+        # Clean dictionary to remove None values
         update_data = {k: v for k, v in profile.dict().items() if v is not None and k != "user_id"}
         
+        # Format full name for display
         if profile.first_name:
             fname = profile.first_name or ""
             mname = profile.middle_name or ""
@@ -208,9 +215,11 @@ def delete_session(session_id: str, user_id: str = Query(...)):
 @app.get("/history")
 def get_history(user_id: str, session_id: Optional[str] = Query(None), subject: Optional[str] = None, chapter: Optional[str] = None):
     try:
+        # Priority: Use session_id if available
         if session_id:
             target_id = session_id
         elif subject and chapter:
+            # Legacy fallback
             target_id = f"{subject}_{chapter}"
         else:
             return {"messages": []}
@@ -219,6 +228,7 @@ def get_history(user_id: str, session_id: Optional[str] = Query(None), subject: 
                         .collection("chat_sessions").document(target_id)\
                         .collection("messages")
         
+        # Sort messages by timestamp ASCENDING
         docs = history_ref.order_by("timestamp").limit(50).stream()
         
         messages = []
@@ -238,6 +248,7 @@ def get_history(user_id: str, session_id: Optional[str] = Query(None), subject: 
 @app.post("/chat")
 def chat_tutor(request: ChatRequest):
     try:
+        # 1. Use Unique Session ID if provided, else generate one based on chapter
         if request.session_id:
             session_id = request.session_id
         else:
@@ -248,6 +259,7 @@ def chat_tutor(request: ChatRequest):
         messages_ref = session_ref.collection("messages")
         current_ts = int(time.time() * 1000)
 
+        # 2. Update Session Metadata (Includes Class/Group for History display)
         session_ref.set({
             "subject": request.subject,
             "chapter": request.chapter_id, 
@@ -257,16 +269,20 @@ def chat_tutor(request: ChatRequest):
             "last_message": request.message[:50]
         }, merge=True)
 
+        # 3. Save User Message
         messages_ref.add({"text": request.message, "sender": "user", "timestamp": current_ts})
 
+        # 4. RAG Logic (Fetching Book Content)
         rag_doc_id = f"{request.class_level}_{request.subject}_{request.chapter_id}".replace(" ", "_")
         book_doc = db.collection("book_content").document(rag_doc_id).get()
         book_context = book_doc.to_dict().get("text_content", "") if book_doc.exists else "No specific book content found. Use general knowledge."
 
+        # 5. Fetch History (Context for AI)
         docs = messages_ref.order_by("timestamp").limit(10).stream()
         msgs_list = [d.to_dict() for d in docs]
         history_text = "\n".join([f"{'Student' if m['sender'] == 'user' else 'Tutor'}: {m['text']}" for m in msgs_list])
 
+        # 6. Dynamic Persona (Language)
         lang_instruction = "Speak in a friendly mix of Bangla and English (Tanglish). Act like a Bangladeshi older brother/sister (Bhaiya/Apu)."
         if request.medium and "English" in request.medium:
             lang_instruction = "You are a Tutor for English Version students. Explain primarily in English. You may use Bangla text for very difficult terms only if necessary."
@@ -292,6 +308,7 @@ def chat_tutor(request: ChatRequest):
         {request.message}
         """
         
+        # 7. Call Gemini
         ai_reply = call_gemini_raw(system_instruction, full_prompt)
         messages_ref.add({"text": ai_reply, "sender": "ai", "timestamp": current_ts + 1})
 
