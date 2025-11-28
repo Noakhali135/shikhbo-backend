@@ -2,10 +2,10 @@ import os
 import requests
 import firebase_admin
 from firebase_admin import credentials, firestore
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List, Dict, Any
 import time
 
 # --- 1. Initialize Firebase ---
@@ -38,14 +38,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- 3. Gemini Configuration ---
+# --- 3. Configuration ---
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-# Using Flash Lite as requested
+# Admin Password (Set this in Render Env Vars!)
+ADMIN_SECRET_KEY = os.environ.get("ADMIN_SECRET_KEY", "my-secret-admin-password") 
 MODEL_NAME = "gemini-2.5-flash-lite-preview-09-2025" 
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent?key={GEMINI_API_KEY}"
 
 # --- 4. Data Models ---
 
+# Student App Models
 class ChatRequest(BaseModel):
     user_id: str
     message: str
@@ -76,9 +78,26 @@ class RenameSessionRequest(BaseModel):
     user_id: str
     new_title: str
 
-# --- 5. Helper Functions ---
+# Admin Models
+class AdminContentUpload(BaseModel):
+    class_level: str
+    group: str
+    subject: str
+    chapter_id: str
+    chapter_title: str
+    chapter_title_bn: str
+    text_content: str
+
+# --- 5. Security (Admin Only) ---
+def verify_admin(x_admin_key: str = Header(..., alias="X-Admin-Key")):
+    """
+    Validates the Admin Key sent from the React Frontend.
+    """
+    if x_admin_key != ADMIN_SECRET_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized Admin Access")
+
+# --- 6. Helper Functions ---
 def call_gemini_raw(system_instruction: str, prompt: str):
-    # Constructing payload with System Instruction for persona
     payload = { 
         "contents": [{ "parts": [{ "text": prompt }] }],
         "system_instruction": { "parts": [{ "text": system_instruction }] },
@@ -98,13 +117,100 @@ def call_gemini_raw(system_instruction: str, prompt: str):
     except Exception as e:
         return "Sorry, I am having trouble connecting to the internet."
 
-# --- 6. Endpoints ---
+# --- 7. Endpoints ---
 
 @app.get("/")
 def home():
     return {"status": "Shikhbo AI Tutor Backend Live"}
 
-# --- AUTH & PROFILE ---
+# ==========================================
+# 🔐 ADMIN PANEL ENDPOINTS
+# ==========================================
+
+@app.get("/admin/users", dependencies=[Depends(verify_admin)])
+def admin_get_users():
+    """List all users with their stats."""
+    try:
+        docs = db.collection("users").stream()
+        users = []
+        for doc in docs:
+            d = doc.to_dict()
+            users.append({
+                "id": doc.id,
+                "name": d.get("name", "Unknown"),
+                "mobile": d.get("mobile", "N/A"),
+                "class_level": d.get("class_level", "N/A"),
+                "group": d.get("group", "N/A"),
+                "total_usage": d.get("total_usage", 0),
+                "last_active": d.get("last_active", 0)
+            })
+        return {"users": users}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/admin/user/{user_id}/history", dependencies=[Depends(verify_admin)])
+def admin_get_user_history(user_id: str):
+    """See sessions for a specific user."""
+    try:
+        sessions = db.collection("users").document(user_id).collection("chat_sessions").order_by("updated_at", direction=firestore.Query.DESCENDING).limit(20).stream()
+        data = []
+        for s in sessions:
+            sd = s.to_dict()
+            data.append(sd)
+        return {"history": data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/admin/upload-content", dependencies=[Depends(verify_admin)])
+def admin_upload_content(data: AdminContentUpload):
+    """
+    Simultaneously updates the 'Book Content' (Text) AND 'Curriculum Metadata' (List).
+    """
+    try:
+        # 1. Upload Book Text (RAG)
+        rag_doc_id = f"{data.class_level}_{data.subject}_{data.chapter_id}".replace(" ", "_")
+        db.collection("book_content").document(rag_doc_id).set({
+            "text_content": data.text_content,
+            "updated_at": int(time.time() * 1000)
+        })
+
+        # 2. Update Curriculum List (Table of Contents)
+        curr_doc_id = f"{data.class_level}_{data.group}".replace(" ", "_")
+        curr_ref = db.collection("curriculum_metadata").document(curr_doc_id)
+        
+        doc = curr_ref.get()
+        if doc.exists:
+            curr_data = doc.to_dict()
+        else:
+            curr_data = {}
+
+        subject_list = curr_data.get(data.subject, [])
+        
+        # Check if chapter exists to avoid duplicates
+        existing_index = next((index for (index, d) in enumerate(subject_list) if d["id"] == data.chapter_id), None)
+        
+        new_chapter_meta = {
+            "id": data.chapter_id,
+            "title": data.chapter_title,
+            "titleBn": data.chapter_title_bn
+        }
+
+        if existing_index is not None:
+            subject_list[existing_index] = new_chapter_meta # Update
+        else:
+            subject_list.append(new_chapter_meta) # Add
+        
+        curr_ref.set({data.subject: subject_list}, merge=True)
+
+        return {"status": "success", "message": f"Uploaded {data.chapter_title} to {data.subject}"}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ==========================================
+# 🎓 STUDENT APP ENDPOINTS
+# ==========================================
+
 @app.post("/auth/check-availability")
 def check_availability(req: AvailabilityRequest):
     try:
@@ -124,10 +230,8 @@ def check_availability(req: AvailabilityRequest):
 def update_user_profile(profile: UserProfileRequest):
     try:
         doc_ref = db.collection("users").document(profile.user_id)
-        # Clean dictionary to remove None values
         update_data = {k: v for k, v in profile.dict().items() if v is not None and k != "user_id"}
         
-        # Format full name for display
         if profile.first_name:
             fname = profile.first_name or ""
             mname = profile.middle_name or ""
@@ -165,8 +269,6 @@ def get_curriculum(class_level: str, group: str):
             return {}
     except Exception as e:
         return {}
-
-# --- SESSIONS ENDPOINTS ---
 
 @app.get("/sessions")
 def get_sessions(user_id: str):
@@ -219,7 +321,6 @@ def get_history(user_id: str, session_id: Optional[str] = Query(None), subject: 
         if session_id:
             target_id = session_id
         elif subject and chapter:
-            # Legacy fallback
             target_id = f"{subject}_{chapter}"
         else:
             return {"messages": []}
@@ -228,7 +329,6 @@ def get_history(user_id: str, session_id: Optional[str] = Query(None), subject: 
                         .collection("chat_sessions").document(target_id)\
                         .collection("messages")
         
-        # Sort messages by timestamp ASCENDING
         docs = history_ref.order_by("timestamp").limit(50).stream()
         
         messages = []
@@ -244,11 +344,9 @@ def get_history(user_id: str, session_id: Optional[str] = Query(None), subject: 
     except Exception as e:
         return {"messages": []}
 
-# --- CHAT LOGIC ---
 @app.post("/chat")
 def chat_tutor(request: ChatRequest):
     try:
-        # 1. Use Unique Session ID if provided, else generate one based on chapter
         if request.session_id:
             session_id = request.session_id
         else:
@@ -259,7 +357,7 @@ def chat_tutor(request: ChatRequest):
         messages_ref = session_ref.collection("messages")
         current_ts = int(time.time() * 1000)
 
-        # 2. Update Session Metadata (Includes Class/Group for History display)
+        # Update Session Metadata
         session_ref.set({
             "subject": request.subject,
             "chapter": request.chapter_id, 
@@ -269,20 +367,24 @@ def chat_tutor(request: ChatRequest):
             "last_message": request.message[:50]
         }, merge=True)
 
-        # 3. Save User Message
+        # Save User Message
         messages_ref.add({"text": request.message, "sender": "user", "timestamp": current_ts})
 
-        # 4. RAG Logic (Fetching Book Content)
+        # Track Tokens
+        user_doc_ref.update({
+            "total_usage": firestore.Increment(len(request.message) // 4),
+            "last_active": current_ts
+        })
+
+        # RAG Logic
         rag_doc_id = f"{request.class_level}_{request.subject}_{request.chapter_id}".replace(" ", "_")
         book_doc = db.collection("book_content").document(rag_doc_id).get()
         book_context = book_doc.to_dict().get("text_content", "") if book_doc.exists else "No specific book content found. Use general knowledge."
 
-        # 5. Fetch History (Context for AI)
         docs = messages_ref.order_by("timestamp").limit(10).stream()
         msgs_list = [d.to_dict() for d in docs]
         history_text = "\n".join([f"{'Student' if m['sender'] == 'user' else 'Tutor'}: {m['text']}" for m in msgs_list])
 
-        # 6. Dynamic Persona (Language)
         lang_instruction = "Speak in a friendly mix of Bangla and English (Tanglish). Act like a Bangladeshi older brother/sister (Bhaiya/Apu)."
         if request.medium and "English" in request.medium:
             lang_instruction = "You are a Tutor for English Version students. Explain primarily in English. You may use Bangla text for very difficult terms only if necessary."
@@ -290,27 +392,17 @@ def chat_tutor(request: ChatRequest):
         system_instruction = f"""
         You are a private tutor for a Bangladeshi student in {request.class_level} ({request.group}).
         {lang_instruction}
-        
-        INSTRUCTIONS:
-        1. STRICTLY use the provided 'Book Context' to answer.
-        2. If the user asks for a Creative Question (Srijonshil), generate one based on the context.
-        3. Use LaTeX formatting for all Math formulas (e.g. $F = ma$).
+        STRICTLY use the provided 'Book Context' to answer.
+        Use LaTeX formatting for all Math formulas (e.g. $F = ma$).
         """
 
-        full_prompt = f"""
-        BOOK CONTEXT:
-        {book_context} 
-
-        CHAT HISTORY:
-        {history_text}
-
-        STUDENT QUESTION:
-        {request.message}
-        """
+        full_prompt = f"BOOK CONTEXT:\n{book_context}\nCHAT HISTORY:\n{history_text}\nSTUDENT QUESTION:\n{request.message}"
         
-        # 7. Call Gemini
         ai_reply = call_gemini_raw(system_instruction, full_prompt)
         messages_ref.add({"text": ai_reply, "sender": "ai", "timestamp": current_ts + 1})
+
+        # Track Output Tokens
+        user_doc_ref.update({"total_usage": firestore.Increment(len(ai_reply) // 4)})
 
         return {"reply": ai_reply}
     except Exception as e:
