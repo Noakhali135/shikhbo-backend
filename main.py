@@ -269,7 +269,7 @@ def chat_tutor(request: ChatRequest):
         history_text = "\n".join([f"{'Student' if m['sender'] == 'user' else 'Tutor'}: {m['text']}" for m in msgs_list])
 
         system_instruction = f"You are a friendly Bangladeshi tutor for {request.class_level} ({request.group}). Speak in Tanglish. Use Book Context."
-        full_prompt = f"BOOK CONTEXT: {book_context[:15000]}\nCHAT HISTORY: {history_text}\nSTUDENT QUESTION: {request.message}"
+        full_prompt = f"BOOK CONTEXT: {book_context}\nCHAT HISTORY: {history_text}\nSTUDENT QUESTION: {request.message}"
         
         ai_reply = call_gemini_raw(system_instruction, full_prompt)
         messages_ref.add({"text": ai_reply, "sender": "ai", "timestamp": current_ts + 1})
