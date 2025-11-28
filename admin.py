@@ -10,12 +10,10 @@ import time
 
 # --- 1. Initialize Firebase ---
 cred = None
-# Check for Render Environment Variable first (Production)
 if os.environ.get("FIREBASE_CREDENTIALS"):
     import json
     service_account_info = json.loads(os.environ.get("FIREBASE_CREDENTIALS"))
     cred = credentials.Certificate(service_account_info)
-# Fallback to local file (Development)
 elif os.path.exists("serviceAccountKey.json"):
     cred = credentials.Certificate("serviceAccountKey.json")
 
@@ -87,7 +85,7 @@ class AdminContentUpload(BaseModel):
     chapter_title_bn: str
     text_content: str
 
-# --- 5. Security (FIXED) ---
+# --- 5. Security (For Admin Panel) ---
 def verify_admin(x_admin_key: str = Header(..., alias="X-Admin-Key")):
     """
     Validates the Admin Key sent from the React Frontend.
@@ -124,7 +122,7 @@ def home():
     return {"status": "Shikhbo AI Tutor Backend Live"}
 
 # ==========================================
-# ADMIN PANEL ENDPOINTS
+# ADMIN PANEL ENDPOINTS (Restored)
 # ==========================================
 
 @app.get("/admin/users", dependencies=[Depends(verify_admin)])
@@ -208,7 +206,7 @@ def admin_upload_content(data: AdminContentUpload):
         raise HTTPException(status_code=500, detail=str(e))
 
 # ==========================================
-# APP ENDPOINTS (Student App)
+# STUDENT APP ENDPOINTS
 # ==========================================
 
 @app.post("/auth/check-availability")
@@ -317,6 +315,7 @@ def delete_session(session_id: str, user_id: str = Query(...)):
 @app.get("/history")
 def get_history(user_id: str, session_id: Optional[str] = Query(None), subject: Optional[str] = None, chapter: Optional[str] = None):
     try:
+        # Priority: Use session_id if available
         if session_id:
             target_id = session_id
         elif subject and chapter:
