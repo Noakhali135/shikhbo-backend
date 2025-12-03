@@ -198,7 +198,7 @@ async def chat_tutor(req: ChatRequest):
             history_text += f"{role}: {msg['text']}\n"
 
         # 3. Call AI
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        model = genai.GenerativeModel("gemini-2.5-flash-lite")
         
         prompt = (
             f"SYSTEM INSTRUCTION: {system_instruction}\n"
