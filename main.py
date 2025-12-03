@@ -40,7 +40,7 @@ if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
 # Admin Secret (Set this in Render Env Vars)
-ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "123qwe")
+ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "my_super_secret_admin_key_123")
 
 # --- Models ---
 
