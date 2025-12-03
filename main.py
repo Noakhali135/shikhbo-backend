@@ -30,7 +30,7 @@ if not firebase_admin._apps:
         firebase_admin.initialize_app(cred)
         logger.info("Firebase Initialized")
     else:
-        logger.warning("No Firebase Credentials found! Database operations will fail.")
+        logger.warning("No Firebase Credentials found!")
 
 db = firestore.client()
 
@@ -39,8 +39,15 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
-# Admin Secret (Set this in Render Env Vars)
-ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "my_super_secret_admin_key_123")
+# --- ADMIN SECURITY ---
+# This matches the "Admin Secret Key" you will type in the HTML login
+ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "change_this_in_render_env_vars")
+
+async def verify_admin(x_admin_key: str = Header(...)):
+    """Blocks request if the key is wrong"""
+    if x_admin_key != ADMIN_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    return True
 
 # --- Models ---
 
@@ -74,7 +81,7 @@ class RenameSessionRequest(BaseModel):
     user_id: str
     new_title: str
 
-# Admin Models
+# -- Admin Specific Models --
 class Chapter(BaseModel):
     id: str
     title: str
@@ -97,17 +104,11 @@ app = FastAPI(title="Shikhbo AI Backend")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"], # Crucial: Allows admin.html to talk to Render
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# --- Security Dependency ---
-async def verify_admin(x_admin_key: str = Header(...)):
-    if x_admin_key != ADMIN_SECRET:
-        raise HTTPException(status_code=401, detail="Invalid Admin Key")
-    return True
 
 # --- Helper Functions ---
 
@@ -132,24 +133,16 @@ def fetch_book_context(class_level: str, subject: str, chapter_id: str) -> str:
         logger.error(f"Error fetching context: {e}")
     return ""
 
-# --- Endpoints ---
-
-@app.get("/")
-def health_check():
-    return {"status": "active", "service": "Shikhbo AI"}
-
-# --- ADMIN ENDPOINTS (NEW) ---
+# ==========================================
+#       ADMIN ENDPOINTS (NEW)
+# ==========================================
 
 @app.get("/admin/stats", dependencies=[Depends(verify_admin)])
 def get_admin_stats():
-    """Get basic usage statistics."""
+    """Login check & Stats"""
     try:
-        # Note: Counting documents is expensive in Firestore. 
-        # For MVP (<1000 users) this is fine. For scale, maintain a separate counter document.
+        # Simple count estimation
         users_count = len(list(db.collection("users").stream()))
-        
-        # We can't easily count all subcollections in Firestore without recursive functions.
-        # Returning user count is a good start.
         return {
             "total_users": users_count,
             "status": "online"
@@ -159,7 +152,6 @@ def get_admin_stats():
 
 @app.get("/admin/users", dependencies=[Depends(verify_admin)])
 def get_all_users(limit: int = 50):
-    """List recent users."""
     try:
         docs = db.collection("users").order_by("updated_at", direction=firestore.Query.DESCENDING).limit(limit).stream()
         users = []
@@ -177,15 +169,11 @@ def get_all_users(limit: int = 50):
 
 @app.post("/admin/chapter", dependencies=[Depends(verify_admin)])
 def update_curriculum(req: UpdateChapterRequest):
-    """Add or Remove chapters for a subject."""
+    """Add/Edit chapters"""
     try:
         doc_id = f"{req.class_level}_{req.group}".replace(" ", "_")
         doc_ref = db.collection("curriculum_metadata").document(doc_id)
-        
-        # Serialize chapters list
         chapters_data = [c.dict() for c in req.chapters]
-        
-        # Update specific subject field (merge=True preserves other subjects)
         doc_ref.set({req.subject: chapters_data}, merge=True)
         return {"status": "success"}
     except Exception as e:
@@ -193,11 +181,10 @@ def update_curriculum(req: UpdateChapterRequest):
 
 @app.post("/admin/context", dependencies=[Depends(verify_admin)])
 def update_book_context(req: UpdateContextRequest):
-    """Upload text content for a chapter."""
+    """Upload Book Text"""
     try:
         doc_id = f"{req.class_level}_{req.subject}_{req.chapter_id}".replace(" ", "_")
         doc_ref = db.collection("book_content").document(doc_id)
-        
         doc_ref.set({
             "text_content": req.text_content,
             "updated_at": firestore.SERVER_TIMESTAMP
@@ -207,13 +194,18 @@ def update_book_context(req: UpdateContextRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/admin/context", dependencies=[Depends(verify_admin)])
-def get_book_context(class_level: str, subject: str, chapter_id: str):
-    """Retrieve existing context."""
+def get_book_context(class_level: str, subject: str, chapter_id: str, verified=Depends(verify_admin)):
+    """Read Book Text"""
     text = fetch_book_context(class_level, subject, chapter_id)
     return {"text_content": text}
 
+# ==========================================
+#       STUDENT APP ENDPOINTS (EXISTING)
+# ==========================================
 
-# --- EXISTING ENDPOINTS ---
+@app.get("/")
+def health_check():
+    return {"status": "Shikhbo Backend Live"}
 
 @app.post("/auth/check-availability")
 def check_availability(req: AvailabilityRequest):
@@ -228,8 +220,7 @@ def check_availability(req: AvailabilityRequest):
     except HTTPException as he:
         raise he
     except Exception as e:
-        logger.error(f"Availability check error: {e}")
-        return {"available": True}
+        return {"available": True} # Fail open for MVP
 
 @app.post("/user/profile")
 def save_profile(profile: UserProfile):
@@ -243,7 +234,6 @@ def save_profile(profile: UserProfile):
         doc_ref.set(update_data, merge=True)
         return {"status": "success"}
     except Exception as e:
-        logger.error(f"Profile save error: {e}")
         raise HTTPException(status_code=500, detail="Failed to save profile")
 
 @app.get("/user/{user_id}")
@@ -253,8 +243,6 @@ def get_profile(user_id: str):
         if doc.exists:
             return doc.to_dict()
         raise HTTPException(status_code=404, detail="User not found")
-    except HTTPException as he:
-        raise he
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -267,7 +255,6 @@ def get_curriculum(class_level: str = Query(...), group: str = Query(...)):
             return doc.to_dict() 
         return {}
     except Exception as e:
-        logger.error(f"Curriculum fetch error: {e}")
         return {}
 
 @app.post("/chat")
@@ -327,7 +314,6 @@ async def chat_tutor(req: ChatRequest):
         return {"reply": ai_reply}
 
     except Exception as e:
-        logger.error(f"Chat error: {e}")
         return {"reply": "I'm having a little trouble connecting right now. Could you ask that again?"}
 
 @app.get("/sessions")
