@@ -43,7 +43,7 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 else:
-    logger.error("GEMINI_API_KEY Not Found in Environment Variables!")
+    logger.error("GEMINI_API_KEY Not Found!")
 
 # --- ADMIN SECURITY ---
 ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "change_this_in_render_env_vars")
@@ -112,15 +112,30 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Helper Functions ---
+# --- CRITICAL UPDATE: System Instruction ---
 def get_system_instruction(class_level: str, group: str, medium: str, subject: str) -> str:
-    lang_instruction = "Reply primarily in English." if medium == "English Version" else "Reply in a mix of Bangla (Tanglish) and English naturally."
+    # 1. Determine Output Language based on User's Medium
+    if medium == "English Version":
+        lang_rule = (
+            "Reply strictly in English. "
+            "Explain concepts using clear English terminology."
+        )
+    else:
+        # Default to Bangla Medium
+        lang_rule = (
+            "Reply primarily in standard Bangla language (using Bangla script). "
+            "Do NOT use Romanized Bangla (Banglish/Tanglish) in your output. "
+            "You may use English technical terms in parentheses where helpful, e.g., 'বল (Force)'."
+        )
+
     return (
-        f"You are a friendly and encouraging AI Tutor for a student in {class_level} ({group}), {medium}. "
+        f"You are a friendly, encouraging, and expert AI Tutor for a student in {class_level} ({group}), {medium}. "
         f"The subject is {subject}. "
-        f"{lang_instruction} "
+        f"{lang_rule} "
+        "IMPORTANT: You must understand the student's question whether they type in Bangla, English, or Banglish (Romanized Bangla), "
+        "but you must strictly follow the output language rules defined above (Bangla Script for Bangla Medium, English for English Version). "
         "Keep answers concise, engaging, and easy to understand. "
-        "Use emojis occasionally. "
+        "Use emojis occasionally to be friendly. "
         "If the student asks a math or physics problem, solve it step-by-step using LaTeX formatting for equations (e.g., $$x^2$$)."
     )
 
@@ -145,11 +160,10 @@ def health_check():
 @app.post("/chat")
 async def chat_tutor(req: ChatRequest):
     try:
-        # 1. Validation
         if not GEMINI_API_KEY:
-             return {"reply": "System Error: Gemini API Key is missing on the server."}
+             return {"reply": "System Error: Gemini API Key is missing."}
 
-        # 2. Database Operations
+        # 1. DB Operations
         user_ref = db.collection("users").document(req.user_id)
         session_ref = user_ref.collection("chat_sessions").document(req.session_id)
         msgs_ref = session_ref.collection("messages")
@@ -171,7 +185,7 @@ async def chat_tutor(req: ChatRequest):
         }
         session_ref.set(session_data, merge=True)
 
-        # 3. Context Preparation
+        # 2. Prepare Context
         system_instruction = get_system_instruction(req.class_level, req.group, req.medium, req.subject)
         book_context = fetch_book_context(req.class_level, req.subject, req.chapter_id)
         
@@ -183,8 +197,8 @@ async def chat_tutor(req: ChatRequest):
             role = "Student" if msg['sender'] == 'user' else "Tutor"
             history_text += f"{role}: {msg['text']}\n"
 
-        # 4. Gemini Call (With Safety Settings)
-        model = genai.GenerativeModel("gemini-2.5-flash-lite")
+        # 3. Call AI
+        model = genai.GenerativeModel("gemini-1.5-flash")
         
         prompt = (
             f"SYSTEM INSTRUCTION: {system_instruction}\n"
@@ -194,7 +208,7 @@ async def chat_tutor(req: ChatRequest):
             f"TUTOR:"
         )
 
-        # Allow everything (since this is education/math/science)
+        # Allow Math/Science content
         safety_settings = {
             HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
             HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
@@ -205,7 +219,7 @@ async def chat_tutor(req: ChatRequest):
         response = model.generate_content(prompt, safety_settings=safety_settings)
         ai_reply = response.text
 
-        # 5. Token Tracking
+        # 4. Stats
         try:
             if hasattr(response, 'usage_metadata'):
                 t_in = response.usage_metadata.prompt_token_count
@@ -227,11 +241,9 @@ async def chat_tutor(req: ChatRequest):
 
     except Exception as e:
         logger.error(f"Chat Error: {e}")
-        # Return the ACTUAL error to the frontend for debugging
         return {"reply": f"System Error: {str(e)}"}
 
-# --- Other Endpoints (Auth/Profile/Curriculum/Admin) ---
-# (Keep these exactly as they were in the previous main.py, they are fine)
+# --- Existing Helper Endpoints ---
 
 @app.post("/auth/check-availability")
 def check_availability(req: AvailabilityRequest):
@@ -316,10 +328,7 @@ def get_chat_history(user_id: str, session_id: str):
         for doc in docs:
             d = doc.to_dict()
             messages.append({
-                "id": doc.id,
-                "text": d.get("text"),
-                "isUser": d.get("sender") == "user",
-                "time": d.get("timestamp")
+                "id": doc.id, "text": d.get("text"), "isUser": d.get("sender") == "user", "time": d.get("timestamp")
             })
         return {"messages": messages}
     except Exception as e:
@@ -328,10 +337,8 @@ def get_chat_history(user_id: str, session_id: str):
 @app.patch("/session/{session_id}/rename")
 def rename_session(session_id: str, req: RenameSessionRequest):
     try:
-        doc_ref = db.collection("users").document(req.user_id)\
-                    .collection("chat_sessions").document(session_id)
-        if not doc_ref.get().exists:
-            raise HTTPException(status_code=404, detail="Session not found")
+        doc_ref = db.collection("users").document(req.user_id).collection("chat_sessions").document(session_id)
+        if not doc_ref.get().exists: raise HTTPException(status_code=404, detail="Session not found")
         doc_ref.update({"custom_title": req.new_title})
         return {"status": "success"}
     except Exception as e:
@@ -340,22 +347,19 @@ def rename_session(session_id: str, req: RenameSessionRequest):
 @app.delete("/session/{session_id}")
 def delete_session(session_id: str, user_id: str = Query(...)):
     try:
-        doc_ref = db.collection("users").document(user_id)\
-                    .collection("chat_sessions").document(session_id)
+        doc_ref = db.collection("users").document(user_id).collection("chat_sessions").document(session_id)
         doc_ref.delete()
         return {"status": "success"}
     except Exception as e:
         raise HTTPException(status_code=500, detail="Failed to delete")
 
-# Admin Endpoints
+# Admin Endpoints (Stats, Users, Curriculum, Context)
 @app.get("/admin/stats", dependencies=[Depends(verify_admin)])
 def get_admin_stats():
     try:
         users_count = len(list(db.collection("users").stream()))
         stats_doc = db.collection("admin").document("global_stats").get()
-        total_tokens = 0
-        if stats_doc.exists:
-            total_tokens = stats_doc.to_dict().get("total_tokens", 0)
+        total_tokens = stats_doc.to_dict().get("total_tokens", 0) if stats_doc.exists else 0
         return {"total_users": users_count, "total_tokens": total_tokens, "status": "online"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -367,12 +371,9 @@ def get_all_users(limit: int = 50):
         users = []
         for doc in docs:
             d = doc.to_dict()
-            last_active = d.get("updated_at")
-            if hasattr(last_active, 'isoformat'): last_active = last_active.isoformat()
-            users.append({
-                "id": doc.id, "name": d.get("name", "Unknown"), "class": d.get("class_level", "-"),
-                "email": d.get("email", "-"), "mobile": d.get("mobile", "-"), "last_active": last_active
-            })
+            la = d.get("updated_at"); 
+            if hasattr(la, 'isoformat'): la = la.isoformat()
+            users.append({"id": doc.id, "name": d.get("name"), "class": d.get("class_level"), "email": d.get("email"), "mobile": d.get("mobile"), "last_active": la})
         return {"users": users}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
