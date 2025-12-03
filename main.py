@@ -40,17 +40,14 @@ if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
 # --- ADMIN SECURITY ---
-# This matches the "Admin Secret Key" you will type in the HTML login
 ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "change_this_in_render_env_vars")
 
 async def verify_admin(x_admin_key: str = Header(...)):
-    """Blocks request if the key is wrong"""
     if x_admin_key != ADMIN_SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized")
     return True
 
 # --- Models ---
-
 class AvailabilityRequest(BaseModel):
     email: str
     mobile: str
@@ -81,7 +78,7 @@ class RenameSessionRequest(BaseModel):
     user_id: str
     new_title: str
 
-# -- Admin Specific Models --
+# Admin Models
 class Chapter(BaseModel):
     id: str
     title: str
@@ -104,14 +101,13 @@ app = FastAPI(title="Shikhbo AI Backend")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # Crucial: Allows admin.html to talk to Render
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # --- Helper Functions ---
-
 def get_system_instruction(class_level: str, group: str, medium: str, subject: str) -> str:
     lang_instruction = "Reply primarily in English." if medium == "English Version" else "Reply in a mix of Bangla (Tanglish) and English naturally."
     return (
@@ -134,17 +130,25 @@ def fetch_book_context(class_level: str, subject: str, chapter_id: str) -> str:
     return ""
 
 # ==========================================
-#       ADMIN ENDPOINTS (NEW)
+#       ADMIN ENDPOINTS
 # ==========================================
 
 @app.get("/admin/stats", dependencies=[Depends(verify_admin)])
 def get_admin_stats():
     """Login check & Stats"""
     try:
-        # Simple count estimation
+        # Count Users
         users_count = len(list(db.collection("users").stream()))
+        
+        # Get Token Usage
+        stats_doc = db.collection("admin").document("global_stats").get()
+        total_tokens = 0
+        if stats_doc.exists:
+            total_tokens = stats_doc.to_dict().get("total_tokens", 0)
+
         return {
             "total_users": users_count,
+            "total_tokens": total_tokens,
             "status": "online"
         }
     except Exception as e:
@@ -153,23 +157,32 @@ def get_admin_stats():
 @app.get("/admin/users", dependencies=[Depends(verify_admin)])
 def get_all_users(limit: int = 50):
     try:
+        # Order by updated_at descending
         docs = db.collection("users").order_by("updated_at", direction=firestore.Query.DESCENDING).limit(limit).stream()
         users = []
         for doc in docs:
             d = doc.to_dict()
+            
+            # Safely handle datetime objects
+            last_active = d.get("updated_at")
+            if hasattr(last_active, 'isoformat'):
+                last_active = last_active.isoformat()
+            
             users.append({
                 "id": doc.id,
                 "name": d.get("name", "Unknown"),
                 "class": d.get("class_level", "-"),
-                "last_active": d.get("updated_at")
+                "email": d.get("email", "-"),
+                "mobile": d.get("mobile", "-"),
+                "last_active": last_active
             })
         return {"users": users}
     except Exception as e:
+        logger.error(f"Fetch Users Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/admin/chapter", dependencies=[Depends(verify_admin)])
 def update_curriculum(req: UpdateChapterRequest):
-    """Add/Edit chapters"""
     try:
         doc_id = f"{req.class_level}_{req.group}".replace(" ", "_")
         doc_ref = db.collection("curriculum_metadata").document(doc_id)
@@ -181,7 +194,6 @@ def update_curriculum(req: UpdateChapterRequest):
 
 @app.post("/admin/context", dependencies=[Depends(verify_admin)])
 def update_book_context(req: UpdateContextRequest):
-    """Upload Book Text"""
     try:
         doc_id = f"{req.class_level}_{req.subject}_{req.chapter_id}".replace(" ", "_")
         doc_ref = db.collection("book_content").document(doc_id)
@@ -195,12 +207,11 @@ def update_book_context(req: UpdateContextRequest):
 
 @app.get("/admin/context", dependencies=[Depends(verify_admin)])
 def get_book_context(class_level: str, subject: str, chapter_id: str, verified=Depends(verify_admin)):
-    """Read Book Text"""
     text = fetch_book_context(class_level, subject, chapter_id)
     return {"text_content": text}
 
 # ==========================================
-#       STUDENT APP ENDPOINTS (EXISTING)
+#       STUDENT APP ENDPOINTS
 # ==========================================
 
 @app.get("/")
@@ -220,7 +231,7 @@ def check_availability(req: AvailabilityRequest):
     except HTTPException as he:
         raise he
     except Exception as e:
-        return {"available": True} # Fail open for MVP
+        return {"available": True}
 
 @app.post("/user/profile")
 def save_profile(profile: UserProfile):
@@ -305,6 +316,22 @@ async def chat_tutor(req: ChatRequest):
         response = model.generate_content(prompt)
         ai_reply = response.text
 
+        # --- TOKEN TRACKING ---
+        try:
+            # Safely access usage metadata if available
+            if hasattr(response, 'usage_metadata'):
+                t_in = response.usage_metadata.prompt_token_count
+                t_out = response.usage_metadata.candidates_token_count
+                total_tokens = t_in + t_out
+                
+                # Increment global stats
+                db.collection("admin").document("global_stats").set({
+                    "total_tokens": firestore.Increment(total_tokens)
+                }, merge=True)
+        except Exception as e:
+            logger.warning(f"Failed to track tokens: {e}")
+        # ----------------------
+
         msgs_ref.add({
             "text": ai_reply,
             "sender": "ai",
@@ -314,8 +341,10 @@ async def chat_tutor(req: ChatRequest):
         return {"reply": ai_reply}
 
     except Exception as e:
+        logger.error(f"Chat Error: {e}")
         return {"reply": "I'm having a little trouble connecting right now. Could you ask that again?"}
 
+# History endpoints...
 @app.get("/sessions")
 def get_user_sessions(user_id: str):
     try:
