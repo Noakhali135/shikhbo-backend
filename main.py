@@ -1,27 +1,27 @@
 import os
-from typing import List, Optional
-from fastapi import FastAPI, HTTPException, Header, Depends, Body
+from typing import Optional, List
+from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import create_client, Client
 from google import genai
 from google.genai import types
 
-# --- Configuration ---
+# --- Config ---
+# Ensure these env vars are set in your deployment (e.g. Render/Railway)
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") # Use Service Role for Admin tasks
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY or not GEMINI_API_KEY:
-    raise RuntimeError("Missing Environment Variables")
+if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+    raise RuntimeError("Supabase credentials missing")
 
-# --- Initialize Clients ---
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+# Initialize Clients
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 client = genai.Client(api_key=GEMINI_API_KEY)
 
 app = FastAPI()
 
-# --- CORS ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -30,7 +30,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Pydantic Models ---
+# --- Models ---
 class ChatRequest(BaseModel):
     user_id: str
     session_id: str
@@ -41,161 +41,135 @@ class ChatRequest(BaseModel):
     group: Optional[str] = "Science"
     medium: Optional[str] = "Bangla Medium"
 
-class UploadTextRequest(BaseModel):
+class UploadRequest(BaseModel):
     text: str
     class_level: str
     subject: str
     chapter_id: str
 
-# --- Auth Middleware ---
+# --- Middleware ---
 async def verify_token(authorization: str = Header(...)):
-    """Verifies the Supabase JWT sent from Frontend."""
     if not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Invalid header format")
-    
+        raise HTTPException(401, "Invalid header")
     token = authorization.split(" ")[1]
     user = supabase.auth.get_user(token)
-    
     if not user:
-        raise HTTPException(status_code=401, detail="Invalid Token")
-    
+        raise HTTPException(401, "Invalid token")
     return user.user
 
 async def verify_admin(user=Depends(verify_token)):
-    """Checks if the authenticated user is an admin."""
-    # Fetch profile to check role
-    response = supabase.table("profiles").select("role").eq("id", user.id).single().execute()
-    if not response.data or response.data.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Admins only")
+    # Check profile role
+    res = supabase.table("profiles").select("role").eq("id", user.id).single().execute()
+    if not res.data or res.data.get("role") != 'admin':
+        raise HTTPException(403, "Admins only")
     return user
 
-# --- Vector Search Service ---
-def query_vectors(query_text: str, class_level: str, subject: str) -> str:
-    """
-    1. Embeds the user query using Gemini.
-    2. Searches Supabase vectors.
-    3. Returns combined text context.
-    """
+# --- Logic ---
+def get_rag_context(query: str, class_level: str, subject: str) -> str:
     try:
-        # Embed query
-        embed_resp = client.models.embed_content(
+        # 1. Embed Query
+        embed_res = client.models.embed_content(
             model="text-embedding-004",
-            contents=query_text
+            contents=query
         )
-        query_vector = embed_resp.embeddings[0].values
+        vector = embed_res.embeddings[0].values
 
-        # Call Supabase RPC function 'match_textbook_content'
-        # You must define this function in SQL first (see SQL snippet below)
-        response = supabase.rpc(
-            "match_textbook_content",
-            {
-                "query_embedding": query_vector,
-                "match_threshold": 0.5,
-                "match_count": 3,
-                "filter_class": class_level,
-                "filter_subject": subject
-            }
-        ).execute()
+        # 2. Search DB (RPC Call)
+        rpc_res = supabase.rpc("match_textbook_content", {
+            "query_embedding": vector,
+            "match_threshold": 0.5,
+            "match_count": 3,
+            "filter_class": class_level,
+            "filter_subject": subject
+        }).execute()
 
-        chunks = [item['chunk_text'] for item in response.data]
+        chunks = [item['chunk_text'] for item in rpc_res.data]
         return "\n\n".join(chunks)
-
     except Exception as e:
-        print(f"Vector Search Error: {e}")
+        print(f"RAG Error: {e}")
         return ""
 
-# --- Chat Endpoint ---
+# --- Routes ---
+
 @app.post("/chat")
-async def chat_endpoint(request: ChatRequest, user=Depends(verify_token)):
+async def chat_endpoint(req: ChatRequest, user=Depends(verify_token)):
+    # 1. RAG
+    context = get_rag_context(req.message, req.class_level, req.subject)
     
-    # 1. Retrieve Context (RAG)
-    context_text = query_vectors(request.message, request.class_level, request.subject)
-    
-    # 2. Construct Prompt
+    # 2. System Prompt
     system_instruction = f"""
-    You are a helpful AI Tutor for Bangladeshi students.
-    Context from textbook:
-    {context_text}
+    You are Shikhbo AI, a friendly tutor for Bangladeshi students.
     
-    Answer the student's question based on the context above.
-    If the answer is not in the context, use your general knowledge but mention that it's outside the provided text.
-    Use Markdown for formatting.
+    Context from textbook ({req.subject}):
+    {context}
+    
+    Instructions:
+    - Answer based on the context provided.
+    - If the answer isn't in the context, use your general knowledge but mention it.
+    - Explain simply in a mix of Bangla and English (Banglish) or pure English as preferred.
+    - Use LaTeX for math ($...$).
     """
 
-    # 3. Call Gemini
+    # 3. Generate
     try:
-        response = client.models.generate_content(
-            model="gemini-2.5-flash-lite",
-            contents=request.message,
+        resp = client.models.generate_content(
+            model="gemini-1.5-pro",
+            contents=req.message,
             config=types.GenerateContentConfig(
                 system_instruction=system_instruction,
-                temperature=0.7
+                temperature=0.5
             )
         )
-        reply_text = response.text
+        reply = resp.text
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"AI Error: {str(e)}")
+        raise HTTPException(500, f"Gemini Error: {e}")
 
-    # 4. Save History asynchronously (Fire & Forget logic or await)
-    # Ensure Session Exists
-    session_check = supabase.table("sessions").select("id").eq("id", request.session_id).execute()
-    if not session_check.data:
-        supabase.table("sessions").insert({
-            "id": request.session_id,
-            "user_id": user.id,
-            "subject": request.subject,
-            "chapter_id": request.chapter_id
-        }).execute()
-    
+    # 4. Save History (Async in production)
+    # Upsert Session
+    supabase.table("sessions").upsert({
+        "id": req.session_id,
+        "user_id": user.id,
+        "subject": req.subject,
+        "chapter_id": req.chapter_id,
+        "last_active": "now()"
+    }).execute()
+
     # Insert Messages
     supabase.table("messages").insert([
-        {"session_id": request.session_id, "role": "user", "content": request.message},
-        {"session_id": request.session_id, "role": "ai", "content": reply_text}
+        {"session_id": req.session_id, "role": "user", "content": req.message},
+        {"session_id": req.session_id, "role": "ai", "content": reply}
     ]).execute()
 
-    # Update Session Last Active
-    supabase.table("sessions").update({"last_active": "now()"}).eq("id", request.session_id).execute()
+    return {"reply": reply}
 
-    return {"reply": reply_text}
-
-# --- History Endpoint ---
 @app.get("/history")
 async def get_history(session_id: str, user=Depends(verify_token)):
-    response = supabase.table("messages")\
-        .select("*")\
-        .eq("session_id", session_id)\
-        .order("created_at")\
-        .execute()
-    return {"messages": response.data}
+    res = supabase.table("messages").select("*").eq("session_id", session_id).order("created_at").execute()
+    return {"messages": res.data}
 
-# --- Admin: Upload Text & Vectorize ---
 @app.post("/admin/upload")
-async def upload_content(request: UploadTextRequest, user=Depends(verify_admin)):
-    """
-    Splits text into chunks, embeds them, and saves to DB.
-    """
-    # Simple chunking by 1000 characters (Improve this with a proper splitter if needed)
-    text_chunks = [request.text[i:i+1000] for i in range(0, len(request.text), 1000)]
+async def admin_upload(req: UploadRequest, user=Depends(verify_admin)):
+    # Simple chunker (every 800 chars)
+    chunk_size = 800
+    text = req.text
+    chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
     
-    inserted_count = 0
-    
-    for chunk in text_chunks:
+    count = 0
+    for chunk in chunks:
         # Embed
-        embed_resp = client.models.embed_content(
+        emb = client.models.embed_content(
             model="text-embedding-004",
             contents=chunk
-        )
-        embedding = embed_resp.embeddings[0].values
+        ).embeddings[0].values
         
         # Save
         supabase.table("textbook_content").insert({
-            "class_level": request.class_level,
-            "subject": request.subject,
-            "chapter_id": request.chapter_id,
+            "class_level": req.class_level,
+            "subject": req.subject,
+            "chapter_id": req.chapter_id,
             "chunk_text": chunk,
-            "embedding": embedding
+            "embedding": emb
         }).execute()
+        count += 1
         
-        inserted_count += 1
-        
-    return {"status": "success", "chunks_processed": inserted_count}
+    return {"status": "success", "chunks": count}
