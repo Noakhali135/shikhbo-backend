@@ -1,109 +1,27 @@
 import os
-import time
-import json
-import logging
-from typing import List, Optional, Dict, Any
-
-from fastapi import FastAPI, HTTPException, Query, Header, Depends
+from typing import List, Optional
+from fastapi import FastAPI, HTTPException, Header, Depends, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import firebase_admin
-from firebase_admin import credentials, firestore
-import google.generativeai as genai
-from google.generativeai.types import HarmCategory, HarmBlockThreshold
+from supabase import create_client, Client
+from google import genai
+from google.genai import types
 
 # --- Configuration ---
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("shikhbo-backend")
-
-# Initialize Firebase
-cred = None
-firebase_creds = os.environ.get("FIREBASE_CREDENTIALS")
-
-if firebase_creds:
-    try:
-        cred_dict = json.loads(firebase_creds)
-        cred = credentials.Certificate(cred_dict)
-    except Exception as e:
-        logger.error(f"Firebase Creds Error: {e}")
-elif os.path.exists("serviceAccountKey.json"):
-    cred = credentials.Certificate("serviceAccountKey.json")
-
-if not firebase_admin._apps:
-    if cred:
-        firebase_admin.initialize_app(cred)
-        logger.info("Firebase Initialized")
-    else:
-        logger.warning("No Firebase Credentials found!")
-
-db = firestore.client()
-
-# Initialize Gemini
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") # Use Service Role for Admin tasks
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-else:
-    logger.error("GEMINI_API_KEY Not Found!")
 
-# --- ADMIN SECURITY ---
-ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "change_this_in_render_env_vars")
+if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY or not GEMINI_API_KEY:
+    raise RuntimeError("Missing Environment Variables")
 
-async def verify_admin(x_admin_key: str = Header(...)):
-    if x_admin_key != ADMIN_SECRET:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    return True
+# --- Initialize Clients ---
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+client = genai.Client(api_key=GEMINI_API_KEY)
 
-# --- Models ---
-class AvailabilityRequest(BaseModel):
-    email: str
-    mobile: str
+app = FastAPI()
 
-class UserProfile(BaseModel):
-    user_id: str
-    first_name: Optional[str] = None
-    middle_name: Optional[str] = None
-    last_name: Optional[str] = None
-    mobile: Optional[str] = None
-    email: Optional[str] = None
-    class_level: Optional[str] = None
-    group: Optional[str] = None
-    medium: Optional[str] = None
-    language: Optional[str] = None
-
-class ChatRequest(BaseModel):
-    user_id: str
-    message: str
-    session_id: str
-    subject: str
-    chapter_id: str
-    class_level: str
-    group: str
-    medium: str
-
-class RenameSessionRequest(BaseModel):
-    user_id: str
-    new_title: str
-
-class Chapter(BaseModel):
-    id: str
-    title: str
-    titleBn: str
-
-class UpdateChapterRequest(BaseModel):
-    class_level: str
-    group: str
-    subject: str
-    chapters: List[Chapter]
-
-class UpdateContextRequest(BaseModel):
-    class_level: str
-    subject: str
-    chapter_id: str
-    text_content: str
-
-# --- App Setup ---
-app = FastAPI(title="Shikhbo AI Backend")
-
+# --- CORS ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -112,268 +30,172 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- SYSTEM INSTRUCTION ---
-def get_system_instruction(class_level: str, group: str, medium: str, subject: str) -> str:
-    if medium == "English Version":
-        lang_rule = "LANGUAGE RULE: Speak strictly in fluent, natural English. Do not switch to Bangla unless explaining a specific cultural term."
-    else:
-        lang_rule = "LANGUAGE RULE: Speak primarily in Standard Bangla (Bangla Script). You CANNOT use 'Banglish' or Romanized Bangla. Write exactly like a text book. Use English terms in brackets for technical words."
+# --- Pydantic Models ---
+class ChatRequest(BaseModel):
+    user_id: str
+    session_id: str
+    message: str
+    subject: str
+    chapter_id: str
+    class_level: str
+    group: Optional[str] = "Science"
+    medium: Optional[str] = "Bangla Medium"
 
-    return (
-        f"ROLE: You are an expert, caring, and enthusiastic human private tutor named 'Shikhbo Tutor'. "
-        f"Student: {class_level} ({group}), {medium}. Subject: {subject}.\n\n"
-        f"{lang_rule}\n\n"
-        "PERSONA GUIDELINES:\n"
-        "1. BE HUMAN: Never say 'As an AI'.\n"
-        "2. BE NATURAL: Conversational, warm, encouraging tone.\n"
-        "3. NO LECTURES: Concise answers (2-3 paragraphs max).\n"
-        "4. BE ENCOURAGING: Use emojis occasionally (✨, 👍, 📚).\n"
-        "5. SHOW YOUR WORK: Use LaTeX for math ($$x^2$$).\n"
-    )
+class UploadTextRequest(BaseModel):
+    text: str
+    class_level: str
+    subject: str
+    chapter_id: str
 
-def fetch_book_context(class_level: str, subject: str, chapter_id: str) -> str:
+# --- Auth Middleware ---
+async def verify_token(authorization: str = Header(...)):
+    """Verifies the Supabase JWT sent from Frontend."""
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid header format")
+    
+    token = authorization.split(" ")[1]
+    user = supabase.auth.get_user(token)
+    
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid Token")
+    
+    return user.user
+
+async def verify_admin(user=Depends(verify_token)):
+    """Checks if the authenticated user is an admin."""
+    # Fetch profile to check role
+    response = supabase.table("profiles").select("role").eq("id", user.id).single().execute()
+    if not response.data or response.data.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admins only")
+    return user
+
+# --- Vector Search Service ---
+def query_vectors(query_text: str, class_level: str, subject: str) -> str:
+    """
+    1. Embeds the user query using Gemini.
+    2. Searches Supabase vectors.
+    3. Returns combined text context.
+    """
     try:
-        doc_id = f"{class_level}_{subject}_{chapter_id}".replace(" ", "_")
-        doc = db.collection("book_content").document(doc_id).get()
-        if doc.exists:
-            return doc.to_dict().get("text_content", "")
+        # Embed query
+        embed_resp = client.models.embed_content(
+            model="text-embedding-004",
+            contents=query_text
+        )
+        query_vector = embed_resp.embeddings[0].values
+
+        # Call Supabase RPC function 'match_textbook_content'
+        # You must define this function in SQL first (see SQL snippet below)
+        response = supabase.rpc(
+            "match_textbook_content",
+            {
+                "query_embedding": query_vector,
+                "match_threshold": 0.5,
+                "match_count": 3,
+                "filter_class": class_level,
+                "filter_subject": subject
+            }
+        ).execute()
+
+        chunks = [item['chunk_text'] for item in response.data]
+        return "\n\n".join(chunks)
+
     except Exception as e:
-        logger.error(f"Error fetching context: {e}")
-    return ""
+        print(f"Vector Search Error: {e}")
+        return ""
 
-# ==========================================
-#       ENDPOINTS
-# ==========================================
-
-@app.get("/")
-def health_check():
-    return {"status": "Shikhbo Backend Live"}
-
+# --- Chat Endpoint ---
 @app.post("/chat")
-async def chat_tutor(req: ChatRequest):
+async def chat_endpoint(request: ChatRequest, user=Depends(verify_token)):
+    
+    # 1. Retrieve Context (RAG)
+    context_text = query_vectors(request.message, request.class_level, request.subject)
+    
+    # 2. Construct Prompt
+    system_instruction = f"""
+    You are a helpful AI Tutor for Bangladeshi students.
+    Context from textbook:
+    {context_text}
+    
+    Answer the student's question based on the context above.
+    If the answer is not in the context, use your general knowledge but mention that it's outside the provided text.
+    Use Markdown for formatting.
+    """
+
+    # 3. Call Gemini
     try:
-        if not GEMINI_API_KEY:
-             return {"reply": "System Error: Gemini API Key is missing."}
-
-        # 1. DB Refs
-        user_ref = db.collection("users").document(req.user_id)
-        session_ref = user_ref.collection("chat_sessions").document(req.session_id)
-        msgs_ref = session_ref.collection("messages")
-        
-        # 2. Save User Msg
-        timestamp = int(time.time() * 1000)
-        msgs_ref.add({ "text": req.message, "sender": "user", "timestamp": timestamp })
-
-        session_ref.set({
-            "subject": req.subject, "chapter": req.chapter_id,
-            "class_level": req.class_level, "group": req.group,
-            "updated_at": timestamp, "last_message": req.message[:60]
-        }, merge=True)
-
-        # 3. Context & AI Call
-        system_instruction = get_system_instruction(req.class_level, req.group, req.medium, req.subject)
-        book_context = fetch_book_context(req.class_level, req.subject, req.chapter_id)
-        
-        history_docs = msgs_ref.order_by("timestamp", direction=firestore.Query.DESCENDING).limit(10).stream()
-        history_list = sorted([d.to_dict() for d in history_docs], key=lambda x: x['timestamp'])
-        
-        history_text = "\n".join([f"{'Student' if m['sender'] == 'user' else 'Tutor'}: {m['text']}" for m in history_list])
-
-        model = genai.GenerativeModel("gemini-2.5-flash-lite")
-        prompt = f"SYSTEM: {system_instruction}\nREF: {book_context[:10000]}\nHISTORY:\n{history_text}\nSTUDENT: {req.message}\nTUTOR:"
-
-        safety_settings = {
-            HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
-        }
-
-        response = model.generate_content(prompt, safety_settings=safety_settings)
-        ai_reply = response.text
-
-        # 4. TOKEN TRACKING (UPDATED)
-        try:
-            if hasattr(response, 'usage_metadata'):
-                t_in = response.usage_metadata.prompt_token_count
-                t_out = response.usage_metadata.candidates_token_count
-                total_tokens = t_in + t_out
-                
-                # A. Update Global Stats
-                db.collection("admin").document("global_stats").set({
-                    "total_tokens": firestore.Increment(total_tokens)
-                }, merge=True)
-
-                # B. Update USER Stats (Individual)
-                user_ref.set({
-                    "total_tokens": firestore.Increment(total_tokens),
-                    "updated_at": firestore.SERVER_TIMESTAMP # Ensure last active updates
-                }, merge=True)
-
-        except Exception as e:
-            logger.warning(f"Token tracking error: {e}")
-
-        # 5. Save AI Msg
-        msgs_ref.add({ "text": ai_reply, "sender": "ai", "timestamp": int(time.time() * 1000) + 1 })
-
-        return {"reply": ai_reply}
-
+        response = client.models.generate_content(
+            model="gemini-2.5-flash-lite",
+            contents=request.message,
+            config=types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                temperature=0.7
+            )
+        )
+        reply_text = response.text
     except Exception as e:
-        logger.error(f"Chat Error: {e}")
-        return {"reply": f"System Error: {str(e)}"}
+        raise HTTPException(status_code=500, detail=f"AI Error: {str(e)}")
 
-# --- Admin Endpoints (Stats & Users) ---
+    # 4. Save History asynchronously (Fire & Forget logic or await)
+    # Ensure Session Exists
+    session_check = supabase.table("sessions").select("id").eq("id", request.session_id).execute()
+    if not session_check.data:
+        supabase.table("sessions").insert({
+            "id": request.session_id,
+            "user_id": user.id,
+            "subject": request.subject,
+            "chapter_id": request.chapter_id
+        }).execute()
+    
+    # Insert Messages
+    supabase.table("messages").insert([
+        {"session_id": request.session_id, "role": "user", "content": request.message},
+        {"session_id": request.session_id, "role": "ai", "content": reply_text}
+    ]).execute()
 
-@app.get("/admin/stats", dependencies=[Depends(verify_admin)])
-def get_admin_stats():
-    try:
-        users_count = len(list(db.collection("users").stream()))
-        stats_doc = db.collection("admin").document("global_stats").get()
-        total_tokens = stats_doc.to_dict().get("total_tokens", 0) if stats_doc.exists else 0
-        return {"total_users": users_count, "total_tokens": total_tokens, "status": "online"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    # Update Session Last Active
+    supabase.table("sessions").update({"last_active": "now()"}).eq("id", request.session_id).execute()
 
-@app.get("/admin/users", dependencies=[Depends(verify_admin)])
-def get_all_users(limit: int = 50):
-    try:
-        docs = db.collection("users").order_by("updated_at", direction=firestore.Query.DESCENDING).limit(limit).stream()
-        users = []
-        for doc in docs:
-            d = doc.to_dict()
-            la = d.get("updated_at")
-            if hasattr(la, 'isoformat'): la = la.isoformat()
-            
-            users.append({
-                "id": doc.id,
-                "name": d.get("name", "Unknown"),
-                "class": d.get("class_level", "-"),
-                "group": d.get("group", "-"),
-                "medium": d.get("medium", "-"),
-                "email": d.get("email", "-"),
-                "mobile": d.get("mobile", "-"),
-                "total_tokens": d.get("total_tokens", 0), # SEND TOKEN COUNT
-                "last_active": la
-            })
-        return {"users": users}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return {"reply": reply_text}
 
-# ... (Keep all other endpoints: auth, profile, curriculum, history, chapter, context exactly as before) ...
-# Just keeping them hidden here for brevity, but make sure they are in the final file! 
-# COPY THE REST FROM THE PREVIOUS FILE IF NEEDED, OR I CAN PASTE FULL FILE IF YOU PREFER.
-# FOR SAFETY, HERE ARE THE REST OF THE ENDPOINTS:
-
-@app.post("/auth/check-availability")
-def check_availability(req: AvailabilityRequest):
-    try:
-        phone_query = db.collection("users").where("mobile", "==", req.mobile).limit(1).stream()
-        if any(phone_query): raise HTTPException(status_code=409, detail="Mobile number already registered")
-        email_query = db.collection("users").where("email", "==", req.email).limit(1).stream()
-        if any(email_query): raise HTTPException(status_code=409, detail="Email already registered")
-        return {"available": True}
-    except HTTPException as he: raise he
-    except Exception: return {"available": True}
-
-@app.post("/user/profile")
-def save_profile(profile: UserProfile):
-    try:
-        doc_ref = db.collection("users").document(profile.user_id)
-        update_data = {k: v for k, v in profile.dict().items() if v is not None}
-        fname = profile.first_name or ""
-        lname = profile.last_name or ""
-        update_data["name"] = f"{fname} {lname}".strip()
-        update_data["updated_at"] = firestore.SERVER_TIMESTAMP
-        doc_ref.set(update_data, merge=True)
-        return {"status": "success"}
-    except Exception: raise HTTPException(status_code=500, detail="Failed")
-
-@app.get("/user/{user_id}")
-def get_profile(user_id: str):
-    try:
-        doc = db.collection("users").document(user_id).get()
-        if doc.exists: return doc.to_dict()
-        raise HTTPException(status_code=404, detail="User not found")
-    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/curriculum")
-def get_curriculum(class_level: str = Query(...), group: str = Query(...)):
-    try:
-        doc_id = f"{class_level}_{group}".replace(" ", "_")
-        doc = db.collection("curriculum_metadata").document(doc_id).get()
-        if doc.exists: return doc.to_dict() 
-        return {}
-    except Exception: return {}
-
-@app.get("/sessions")
-def get_user_sessions(user_id: str):
-    try:
-        sessions_ref = db.collection("users").document(user_id).collection("chat_sessions")
-        docs = sessions_ref.order_by("updated_at", direction=firestore.Query.DESCENDING).stream()
-        sessions = []
-        for doc in docs:
-            d = doc.to_dict()
-            sessions.append({
-                "id": doc.id, "subject": d.get("subject"), "chapter": d.get("chapter"),
-                "custom_title": d.get("custom_title"), "title_bn": d.get("title_bn"),
-                "class_level": d.get("class_level"), "group": d.get("group"), "updated_at": d.get("updated_at")
-            })
-        return {"sessions": sessions}
-    except Exception: return {"sessions": []}
-
+# --- History Endpoint ---
 @app.get("/history")
-def get_chat_history(user_id: str, session_id: str):
-    try:
-        msgs_ref = db.collection("users").document(user_id).collection("chat_sessions").document(session_id).collection("messages")
-        docs = msgs_ref.order_by("timestamp").limit(100).stream()
-        messages = []
-        for doc in docs:
-            d = doc.to_dict()
-            messages.append({"id": doc.id, "text": d.get("text"), "isUser": d.get("sender") == "user", "time": d.get("timestamp")})
-        return {"messages": messages}
-    except Exception: return {"messages": []}
+async def get_history(session_id: str, user=Depends(verify_token)):
+    response = supabase.table("messages")\
+        .select("*")\
+        .eq("session_id", session_id)\
+        .order("created_at")\
+        .execute()
+    return {"messages": response.data}
 
-@app.patch("/session/{session_id}/rename")
-def rename_session(session_id: str, req: RenameSessionRequest):
-    try:
-        doc_ref = db.collection("users").document(req.user_id).collection("chat_sessions").document(session_id)
-        if not doc_ref.get().exists: raise HTTPException(status_code=404, detail="Session not found")
-        doc_ref.update({"custom_title": req.new_title})
-        return {"status": "success"}
-    except Exception: raise HTTPException(status_code=500, detail="Failed")
-
-@app.delete("/session/{session_id}")
-def delete_session(session_id: str, user_id: str = Query(...)):
-    try:
-        doc_ref = db.collection("users").document(user_id).collection("chat_sessions").document(session_id)
-        doc_ref.delete()
-        return {"status": "success"}
-    except Exception: raise HTTPException(status_code=500, detail="Failed")
-
-@app.post("/admin/chapter", dependencies=[Depends(verify_admin)])
-def update_curriculum(req: UpdateChapterRequest):
-    try:
-        doc_id = f"{req.class_level}_{req.group}".replace(" ", "_")
-        doc_ref = db.collection("curriculum_metadata").document(doc_id)
-        chapters_data = [c.dict() for c in req.chapters]
-        doc_ref.set({req.subject: chapters_data}, merge=True)
-        return {"status": "success"}
-    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/admin/context", dependencies=[Depends(verify_admin)])
-def update_book_context(req: UpdateContextRequest):
-    try:
-        doc_id = f"{req.class_level}_{req.subject}_{req.chapter_id}".replace(" ", "_")
-        doc_ref = db.collection("book_content").document(doc_id)
-        doc_ref.set({"text_content": req.text_content, "updated_at": firestore.SERVER_TIMESTAMP})
-        return {"status": "success"}
-    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/admin/context", dependencies=[Depends(verify_admin)])
-def get_book_context(class_level: str, subject: str, chapter_id: str, verified=Depends(verify_admin)):
-    text = fetch_book_context(class_level, subject, chapter_id)
-    return {"text_content": text}
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+# --- Admin: Upload Text & Vectorize ---
+@app.post("/admin/upload")
+async def upload_content(request: UploadTextRequest, user=Depends(verify_admin)):
+    """
+    Splits text into chunks, embeds them, and saves to DB.
+    """
+    # Simple chunking by 1000 characters (Improve this with a proper splitter if needed)
+    text_chunks = [request.text[i:i+1000] for i in range(0, len(request.text), 1000)]
+    
+    inserted_count = 0
+    
+    for chunk in text_chunks:
+        # Embed
+        embed_resp = client.models.embed_content(
+            model="text-embedding-004",
+            contents=chunk
+        )
+        embedding = embed_resp.embeddings[0].values
+        
+        # Save
+        supabase.table("textbook_content").insert({
+            "class_level": request.class_level,
+            "subject": request.subject,
+            "chapter_id": request.chapter_id,
+            "chunk_text": chunk,
+            "embedding": embedding
+        }).execute()
+        
+        inserted_count += 1
+        
+    return {"status": "success", "chunks_processed": inserted_count}
